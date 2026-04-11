@@ -1,0 +1,3 @@
+"""
+JAX-BEM assembly routines
+"""
