@@ -1,3 +1,6 @@
+import jax
+jax.config.update('jax_platform_name', 'cpu')
+jax.config.update('jax_enable_x64', False)
 import jax.numpy as jnp
 from jax.scipy.sparse.linalg import gmres
 import bempp_cl.api
