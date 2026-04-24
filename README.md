@@ -9,7 +9,8 @@ And code by James Hipperson, Dr. Jonathan Hargreaves and Prof. Trevor Cox
 ```pip install numpy scipy matplotlib jax bempp_cl```
 
 Optional: gmsh for displaying 3D mesh files: https://gmsh.info/
-You might need to manually set the location of the gmsh binary: bempp_cl.api.GMSH_PATH = '/usr/bin/gmsh'
+You might need to manually set the location of the gmsh binary: 
+```bempp_cl.api.GMSH_PATH = '/path/to/gmsh'```
 
 # Usage:
 
