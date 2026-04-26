@@ -59,24 +59,25 @@ def incident_field_normal_derivative(x, n, k0, direction):
 
 #%% L2 projection to compute coefficients (matching bempp)
 
-@partial(jit, static_argnames=['quad_order'])
-def compute_incident_field(vertices, normals, elements, k0, direction, quad_order=4):
+@partial(jit, static_argnames=['quad_order', 'space'])
+def compute_incident_field(vertices, normals, elements, k0, direction, quad_order=4, space='P1'):
     """
-    Compute incident field L2 projections: projections[i] = integral of (f * phi_i) over mesh.
+    Compute incident field L2 projections for the BEM RHS.
 
-    These are the raw inner products used directly as RHS terms in the BEM system
-    (not M^{-1}-weighted coefficients).
+    For P1:  projections[v] = ∫ p_inc · φ_v dS  (integral against vertex basis fns)
+    For DP0: projections[f] = ∫_{Γ_f} p_inc dS   (integral over element f)
 
     Args:
-        vertices: [N, 3] vertex positions
-        normals: [F, 3] element normals
-        elements: [F, 3] triangle indices
-        k0: wavenumber
+        vertices:  [N, 3] vertex positions
+        normals:   [F, 3] element normals
+        elements:  [F, 3] triangle indices
+        k0:        wavenumber
         direction: [3] incident direction
         quad_order: quadrature order
+        space:     'P1' (default) or 'DP0'
 
     Returns:
-        projections: [N] complex L2 inner products at vertices
+        projections: [n_dofs] complex L2 inner products
     """
     n_verts = vertices.shape[0]
     n_faces = elements.shape[0]
@@ -84,40 +85,30 @@ def compute_incident_field(vertices, normals, elements, k0, direction, quad_orde
     quad_points, quad_weights = get_triangle_quadrature(quad_order)
     n_quad = quad_weights.shape[0]
 
-    # P1 basis values at quadrature points [3, Q]
     xi, eta = quad_points[0], quad_points[1]
-    basis_vals = jnp.stack([1.0 - xi - eta, xi, eta], axis=0)
 
-    # Compute integration elements = |cross(e1, e2)| = 2 * triangle_area
-    # This matches bempp: sqrt(det(J^T @ J)) where J = [e1, e2]
     v0 = vertices[elements[:, 0]]
     v1 = vertices[elements[:, 1]]
     v2 = vertices[elements[:, 2]]
     e1 = v1 - v0
     e2 = v2 - v0
     cross = jnp.cross(e1, e2)
-    int_elem = jnp.linalg.norm(cross, axis=1)  # [F] - NOT divided by 2!
+    int_elem = jnp.linalg.norm(cross, axis=1)  # [F], = 2 * area
 
-    # Compute global quadrature points for all elements [F, Q, 3]
-    # x = v0 + xi * (v1 - v0) + eta * (v2 - v0)
     global_points = (v0[:, None, :] +
                      xi[None, :, None] * e1[:, None, :] +
                      eta[None, :, None] * e2[:, None, :])  # [F, Q, 3]
 
-    # Evaluate incident field at all quadrature points [F, Q]
-    global_points_flat = global_points.reshape(-1, 3)  # [F*Q, 3]
-    f_vals_flat = incident_field(global_points_flat, k0, direction)  # [F*Q]
-    f_vals = f_vals_flat.reshape(n_faces, n_quad)  # [F, Q]
+    f_vals = incident_field(global_points.reshape(-1, 3), k0, direction).reshape(n_faces, n_quad)  # [F, Q]
 
-    # Compute projections: proj[i] = sum over elements containing vertex i of
-    #   integral of (f * phi_i) over element
-    # For each element: contribution to vertex j = sum_q (f[q] * phi_j[q] * w[q]) * int_elem
-    local_proj = jnp.einsum('fq,jq,q,f->fj', f_vals, basis_vals, quad_weights, int_elem)  # [F, 3]
-
-    # Scatter to global projections
-    projections = jnp.zeros(n_verts, dtype=COMPLEX_DTYPE)
-    for i in range(3):
-        projections = projections.at[elements[:, i]].add(local_proj[:, i])
+    if space == 'P1':
+        basis_vals = jnp.stack([1.0 - xi - eta, xi, eta], axis=0)  # [3, Q]
+        local_proj = jnp.einsum('fq,jq,q,f->fj', f_vals, basis_vals, quad_weights, int_elem)  # [F, 3]
+        projections = jnp.zeros(n_verts, dtype=COMPLEX_DTYPE)
+        for i in range(3):
+            projections = projections.at[elements[:, i]].add(local_proj[:, i])
+    else:  # DP0: one DOF per element
+        projections = jnp.einsum('fq,q,f->f', f_vals, quad_weights, int_elem).astype(COMPLEX_DTYPE)
 
     return projections
 
@@ -169,70 +160,57 @@ def compute_source_neumann_projection(vertices, elements, source_mask, quad_orde
     return projections
 
 
-@partial(jit, static_argnames=['quad_order'])
-def compute_normal_derivative(vertices, normals, elements, k0, direction, quad_order=4):
+@partial(jit, static_argnames=['quad_order', 'space'])
+def compute_normal_derivative(vertices, normals, elements, k0, direction, quad_order=4, space='P1'):
     """
-    Compute normal derivative L2 projections: projections[i] = integral of (dp/dn * phi_i) over mesh.
+    Compute normal derivative L2 projections for the BEM RHS.
 
-    Following bempp: dp/dn is evaluated at quadrature points using the ELEMENT normal
-    (constant per element), not vertex normals. Returns raw inner products used directly
-    as RHS terms in the BEM system.
+    dp/dn is evaluated using the ELEMENT normal (constant per element).
+
+    For P1:  projections[v] = ∫ (dp_inc/dn) · φ_v dS
+    For DP0: projections[f] = ∫_{Γ_f} dp_inc/dn dS
 
     Args:
-        vertices: [N, 3] vertex positions
-        normals: [F, 3] element normals
-        elements: [F, 3] triangle indices
-        k0: wavenumber
-        direction: [3] incident direction
+        vertices:   [N, 3] vertex positions
+        normals:    [F, 3] element normals
+        elements:   [F, 3] triangle indices
+        k0:         wavenumber
+        direction:  [3] incident direction
         quad_order: quadrature order
+        space:      'P1' (default) or 'DP0'
 
     Returns:
-        projections: [N] complex L2 inner products at vertices
+        projections: [n_dofs] complex L2 inner products
     """
     n_verts = vertices.shape[0]
-    #n_faces = elements.shape[0]
 
     quad_points, quad_weights = get_triangle_quadrature(quad_order)
-    #n_quad = quad_weights.shape[0]
-
-    # P1 basis values at quadrature points [3, Q]
     xi, eta = quad_points[0], quad_points[1]
-    basis_vals = jnp.stack([1.0 - xi - eta, xi, eta], axis=0)
 
-    # Compute integration elements = |cross(e1, e2)| = 2 * triangle_area
-    # This matches bempp: sqrt(det(J^T @ J)) where J = [e1, e2]
     v0 = vertices[elements[:, 0]]
     v1 = vertices[elements[:, 1]]
     v2 = vertices[elements[:, 2]]
     e1 = v1 - v0
     e2 = v2 - v0
     cross = jnp.cross(e1, e2)
-    int_elem = jnp.linalg.norm(cross, axis=1)  # [F] - NOT divided by 2!
+    int_elem = jnp.linalg.norm(cross, axis=1)  # [F], = 2 * area
 
-    # Compute global quadrature points [F, Q, 3]
     global_points = (v0[:, None, :] +
                      xi[None, :, None] * e1[:, None, :] +
-                     eta[None, :, None] * e2[:, None, :])
+                     eta[None, :, None] * e2[:, None, :])  # [F, Q, 3]
 
-    # Evaluate normal derivative at quadrature points using ELEMENT normals
-    # f(x, n) = i * k * (d · n) * exp(i * k * (d · x))
     direction_norm = direction / jnp.linalg.norm(direction)
+    k_dot_x = k0 * jnp.einsum('fqi,i->fq', global_points, direction_norm)  # [F, Q]
+    k_dot_n = k0 * jnp.dot(normals, direction_norm)                          # [F]
+    f_vals = 1j * k_dot_n[:, None] * jnp.exp(1j * k_dot_x)                 # [F, Q]
 
-    # k · x for all points [F, Q]
-    k_dot_x = k0 * jnp.einsum('fqi,i->fq', global_points, direction_norm)
-
-    # k · n using element normal (constant per element) [F]
-    k_dot_n = k0 * jnp.dot(normals, direction_norm)  # [F]
-
-    # Normal derivative values [F, Q]
-    f_vals = 1j * k_dot_n[:, None] * jnp.exp(1j * k_dot_x)
-
-    # Compute projections
-    local_proj = jnp.einsum('fq,jq,q,f->fj', f_vals, basis_vals, quad_weights, int_elem)  # [F, 3]
-
-    # Scatter to global projections
-    projections = jnp.zeros(n_verts, dtype=COMPLEX_DTYPE)
-    for i in range(3):
-        projections = projections.at[elements[:, i]].add(local_proj[:, i])
+    if space == 'P1':
+        basis_vals = jnp.stack([1.0 - xi - eta, xi, eta], axis=0)  # [3, Q]
+        local_proj = jnp.einsum('fq,jq,q,f->fj', f_vals, basis_vals, quad_weights, int_elem)  # [F, 3]
+        projections = jnp.zeros(n_verts, dtype=COMPLEX_DTYPE)
+        for i in range(3):
+            projections = projections.at[elements[:, i]].add(local_proj[:, i])
+    else:  # DP0
+        projections = jnp.einsum('fq,q,f->f', f_vals, quad_weights, int_elem).astype(COMPLEX_DTYPE)
 
     return projections

@@ -49,7 +49,7 @@ def get_boundary_data(vertices, elements):
 
 def propagate(vertices, elements, node_values, k0, grid_size,
               resolution, symmetry=None, chunk_size=65536, grid_center=None,
-              neumann_elem_values=None):
+              neumann_elem_values=None, space='P1'):
     """
     Matrix-free propagation using chunked computation.
 
@@ -60,20 +60,20 @@ def propagate(vertices, elements, node_values, k0, grid_size,
     Memory usage is O(chunk_size * F) instead of O(M * F).
 
     Args:
-        vertices: [N, 3] vertex positions
-        elements: [F, 3] triangle connectivity
-        node_values: [N] solution at vertices (physical surface pressure p)
-        k0: wavenumber
-        grid_size: domain grid extent (cubic side length)
-        resolution: grid resolution (M = resolution^3)
-        symmetry: tuple/array of 3 bools for (XY, XZ, YZ) symmetry planes, or None
-        chunk_size: number of domain points per chunk (tune for memory/speed)
-        grid_center: [3] centre of the domain grid (default: origin)
-        neumann_elem_values: [F] complex element-wise Neumann data g = dp/dn.
-            If None, the single-layer term is omitted (only double-layer computed).
+        vertices:           [N, 3] vertex positions
+        elements:           [F, 3] triangle connectivity
+        node_values:        solution DOF values — [N] for P1 (vertices), [F] for DP0 (elements)
+        k0:                 wavenumber
+        grid_size:          domain grid extent (cubic side length)
+        resolution:         grid resolution (M = resolution^3)
+        symmetry:           tuple/array of 3 bools for (XY, XZ, YZ) planes, or None
+        chunk_size:         domain points per chunk (tune for memory/speed)
+        grid_center:        [3] centre of domain grid (default: origin)
+        neumann_elem_values: [F] element-wise Neumann data dp/dn; None → DL only
+        space:              'P1' (default) or 'DP0'
 
     Returns:
-        [resolution, resolution, resolution] domain field
+        [resolution, resolution, resolution] domain pressure field
     """
     if symmetry is None:
         symmetry_tuple = (False, False, False)
@@ -90,13 +90,13 @@ def propagate(vertices, elements, node_values, k0, grid_size,
 
     return _propagate_jit(vertices, elements, node_values, k0, grid_size,
                           resolution, chunk_size, symmetry_tuple, center,
-                          neumann_elem_values)
+                          neumann_elem_values, space)
 
 
-@partial(jit, static_argnames=['resolution', 'chunk_size', 'symmetry'])
+@partial(jit, static_argnames=['resolution', 'chunk_size', 'symmetry', 'space'])
 def _propagate_jit(vertices, elements, node_values, k0, grid_size,
                    resolution, chunk_size, symmetry, grid_center,
-                   neumann_elem_values):
+                   neumann_elem_values, space):
     """JIT-compiled propagation with symmetry as static argument.
 
     Computes the Kirchhoff-Helmholtz exterior representation:
@@ -106,10 +106,13 @@ def _propagate_jit(vertices, elements, node_values, k0, grid_size,
     """
     active_reflections = get_active_reflections(symmetry)
 
-    # Interpolate nodes to element centers (for DL)
-    element_values = (node_values[elements[:, 0]] +
-                      node_values[elements[:, 1]] +
-                      node_values[elements[:, 2]]) / 3.0
+    # Interpolate to element centroids for the DL potential kernel
+    if space == 'P1':
+        element_values = (node_values[elements[:, 0]] +
+                          node_values[elements[:, 1]] +
+                          node_values[elements[:, 2]]) / 3.0
+    else:  # DP0: solution already lives at element centres
+        element_values = node_values
 
     boundary_points, boundary_normals, boundary_areas = get_boundary_data(vertices, elements)
 
@@ -164,23 +167,22 @@ def _propagate_jit(vertices, elements, node_values, k0, grid_size,
 
 
 def propagate_to_points(vertices, elements, node_values, k0, eval_points,
-                        symmetry=None, neumann_elem_values=None):
+                        symmetry=None, neumann_elem_values=None, space='P1'):
     """
     Evaluate Kirchhoff-Helmholtz exterior representation at arbitrary 3D points:
         p(x) = K[p](x) - V[g](x)
 
-    Lighter-weight than propagate() — no chunking needed for small point sets
-    (e.g. directivity arcs with O(100) points).
+    Lighter-weight than propagate() — no chunking needed for small point sets.
 
     Args:
-        vertices: [N, 3] vertex positions
-        elements: [F, 3] triangle connectivity
-        node_values: [N] boundary solution (physical surface pressure p)
-        k0: wavenumber
-        eval_points: [M, 3] evaluation points
-        symmetry: tuple/array of 3 bools for (XY, XZ, YZ) planes, or None
-        neumann_elem_values: [F] complex element-wise Neumann data g = dp/dn.
-            If None, the single-layer term is omitted (only double-layer).
+        vertices:            [N, 3] vertex positions
+        elements:            [F, 3] triangle connectivity
+        node_values:         DOF values — [N] for P1, [F] for DP0
+        k0:                  wavenumber
+        eval_points:         [M, 3] evaluation points
+        symmetry:            tuple/array of 3 bools for (XY, XZ, YZ) planes, or None
+        neumann_elem_values: [F] element-wise Neumann data dp/dn; None → DL only
+        space:               'P1' (default) or 'DP0'
 
     Returns:
         [M] complex pressure values
@@ -198,21 +200,24 @@ def propagate_to_points(vertices, elements, node_values, k0, eval_points,
 
     return _propagate_to_points_jit(vertices, elements, node_values, k0,
                                     eval_points, symmetry_tuple,
-                                    neumann_elem_values)
+                                    neumann_elem_values, space)
 
 
-@partial(jit, static_argnames=['symmetry'])
+@partial(jit, static_argnames=['symmetry', 'space'])
 def _propagate_to_points_jit(vertices, elements, node_values, k0,
-                              eval_points, symmetry, neumann_elem_values):
+                              eval_points, symmetry, neumann_elem_values, space):
     """JIT-compiled evaluation at arbitrary points.
 
     Computes K[p] - V[g]: double-layer minus single-layer (Kirchhoff-Helmholtz).
     """
     active_reflections = get_active_reflections(symmetry)
 
-    element_values = (node_values[elements[:, 0]] +
-                      node_values[elements[:, 1]] +
-                      node_values[elements[:, 2]]) / 3.0
+    if space == 'P1':
+        element_values = (node_values[elements[:, 0]] +
+                          node_values[elements[:, 1]] +
+                          node_values[elements[:, 2]]) / 3.0
+    else:  # DP0
+        element_values = node_values
 
     boundary_points, boundary_normals, boundary_areas = get_boundary_data(vertices, elements)
 

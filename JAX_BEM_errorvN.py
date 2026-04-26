@@ -20,114 +20,105 @@ from core.sphere_analytic import sphere_analytic, mask_sphere
 #%% Main solver
 
 def bem_solve(k0, vertices, elements, normals, adjacency_data, incident_direction,
-              eta, quad_order, grid_size, resolution, symmetry):
+              eta, quad_order, grid_size, resolution, symmetry, space='P1'):
     """
     Solve BEM scattering problem using Burton-Miller formulation.
 
-    This function is fully differentiable with respect to vertices and k0
-    when adjacency_data is pre-computed.
-
     Args:
-        k0: wavenumber
-        vertices: [N, 3] vertex positions
-        elements: [F, 3] triangle connectivity (GMSH format)
-        normals: [F, 3] element normals
-        adjacency_data: pre-computed adjacency lists from load_mesh()
+        k0:                 wavenumber
+        vertices:           [N, 3] vertex positions
+        elements:           [F, 3] triangle connectivity
+        normals:            [F, 3] element normals
+        adjacency_data:     pre-computed adjacency lists from load_mesh()
         incident_direction: [3] incident wave direction
-        eta: Burton-Miller coupling parameter (default: 1j)
-        quad_order: quadrature order (1, 3, 4, or 7)
-        grid_size: domain grid extent (cubic side length)
-        resolution: grid resolution for domain solution
-        symmetry: [3] boolean array for [XY, XZ, YZ] symmetry planes
+        eta:                Burton-Miller coupling parameter
+        quad_order:         quadrature order (1, 3, 4, or 7)
+        grid_size:          domain grid extent
+        resolution:         grid resolution for domain solution
+        symmetry:           [3] boolean array for [XY, XZ, YZ] symmetry planes
+        space:              'P1' (default)
 
     Returns:
-        Tuple of (lhs, rhs, boundary_solution, domain_solution, elapsed_time)
+        (lhs, rhs, boundary_solution, domain_solution, elapsed_time)
     """
 
-    print("Assembling operators...")
+    print(f"Assembling operators (space={space})...")
     tic_total = time.perf_counter()
     tic = time.perf_counter()
 
-    # Burton-Miller assembly: lhs = K - 0.5*M + eta*W
     lhs = assemble_bm(vertices, elements, normals, k0, eta, adjacency_data,
-                      quad_order=quad_order, symmetry=symmetry)
+                      quad_order=quad_order, symmetry=symmetry, space=space)
     lhs.block_until_ready()
 
     print("Computing incident field...")
-    # Compute incident field projections (L2 projection integrals)
-    # These functions return projections = <phi_i, f> directly
-    # Note: symmetry is NOT applied to incident field - the symmetric Green's
-    # function in the operators already handles the method of images
     p_inc_proj = compute_incident_field(vertices, normals, elements,
-                                        k0, incident_direction)
+                                        k0, incident_direction, space=space)
     dp_inc_dn_proj = compute_normal_derivative(vertices, normals, elements,
-                                               k0, incident_direction)
+                                               k0, incident_direction, space=space)
     toc = time.perf_counter()
-    print(' Operator assembly - ',round(toc-tic,3),' seconds')
+    print(' Operator assembly - ', round(toc - tic, 3), ' seconds')
 
-    # Burton-Miller RHS: 
     rhs = -p_inc_proj + eta * dp_inc_dn_proj
-    
+
     print("Solving with JAX GMRES...")
     tic = time.perf_counter()
     boundary_solution, info = gmres(lhs, rhs, tol=1e-5, restart=100, maxiter=1000)
     boundary_solution.block_until_ready()
-    
+
     toc = time.perf_counter()
     toc_total = time.perf_counter()
-    
+
     if info == 0:
         print("GMRES converged successfully")
-        print('in ',round(toc-tic,3),' seconds')
+        print('in ', round(toc - tic, 3), ' seconds')
     else:
         print(f"GMRES did not converge. Info: {info}")
-    
+
     domain_solution = propagate(vertices, elements, boundary_solution,
-                                k0, grid_size, resolution, symmetry=symmetry)
+                                k0, grid_size, resolution,
+                                symmetry=symmetry, space=space)
     domain_solution.block_until_ready()
-    
-    jax_time = toc_total-tic_total
-    
-    print("Total time: ",round(jax_time,3), "seconds")
-    
+
+    jax_time = toc_total - tic_total
+    print("Total time: ", round(jax_time, 3), "seconds")
+
     return (
             np.array(lhs), np.array(rhs),
             np.array(boundary_solution), np.array(domain_solution),
             jax_time)
 
 if __name__ == "__main__":
-    # Example usage
-    
+
     # Problem parameters
-    quad_order = 4 # quadrature order (1, 3, 4, or 7). 4 is bempp default.
+    SPACE = 'P1'
+    quad_order = 4  # quadrature order (1, 3, 4, or 7). 4 is bempp default.
     grid_size = 4
     resolution = 128
     eta = 1j
     N = [2, 3, 4, 5]  # bempp regular_sphere refinement levels → [128, 512, 2048, 8192] elements
     incident_direction = jnp.array([1.0, 0.0, 0.0])  # +x direction
-    r0 = 1 # Radius of sphere for analytic solution
-    # Enable/disable symmetry planes, XY, XZ, YZ
+    r0 = 1  # Radius of sphere for analytic solution
     symmetry = jnp.array([False, False, False])
     k0 = 4.0
-    
-    bp_domain_mae = np.zeros((len(N),resolution,resolution,resolution))
-    jax_domain_mae = np.zeros((len(N),resolution,resolution,resolution))
+
+    bp_domain_mae = np.zeros((len(N), resolution, resolution, resolution))
+    jax_domain_mae = np.zeros((len(N), resolution, resolution, resolution))
     rel_domain_mae = np.zeros(len(N))
-    
+
     bempp_time = np.zeros(len(N))
     jax_time = np.zeros(len(N))
-    
+
     for index in range(len(N)):
-    
-        analytic_solution = sphere_analytic(k0, r0, incident_direction, 
+
+        analytic_solution = sphere_analytic(k0, r0, incident_direction,
                                             grid_size, resolution)
-        
+
         mesh = bempp_cl.api.shapes.regular_sphere(int(N[index]))
         vertices, elements, normals, adjacency_data, _ = load_mesh(mesh, symmetry)
-    
+
         print(f"Wavenumber k0 = {k0:.3f}")
-    
-        # Solve
+
+        # JAX solve
         (jax_lhs, jax_rhs,
          jax_boundary_solution, jax_domain_solution, jax_time[index]) = bem_solve(
             k0=k0,
@@ -136,22 +127,25 @@ if __name__ == "__main__":
             normals=normals,
             adjacency_data=adjacency_data,
             incident_direction=incident_direction,
-            eta=eta/k0,
+            eta=eta / k0,
             quad_order=quad_order,
             grid_size=grid_size,
             resolution=resolution,
-            symmetry=symmetry
+            symmetry=symmetry,
+            space=SPACE,
         )
-        
-        print("Solving with bempp: ")
+
+        print("Solving with bempp:")
         bp_tic = time.perf_counter()
-        
-        bp_boundary_solution, assembly_time = bempp_solve(k0, mesh, (1,0,0),
-                                                           grid_size, resolution)
-        # Propagate to domain
-        bp_domain_solution = propagate(mesh.vertices.T, mesh.elements.T,
-                                       jnp.array(bp_boundary_solution),
-                                       k0, grid_size, resolution, symmetry=None)
+
+        bp_boundary_solution, assembly_time = bempp_solve(
+            k0, mesh, (1, 0, 0), space=SPACE)
+
+        # Propagate bempp solution to domain using same space
+        bp_domain_solution = propagate(
+            mesh.vertices.T, mesh.elements.T,
+            jnp.array(bp_boundary_solution),
+            k0, grid_size, resolution, symmetry=None, space=SPACE)
         bp_domain_solution.block_until_ready()
         
         bp_toc = time.perf_counter()

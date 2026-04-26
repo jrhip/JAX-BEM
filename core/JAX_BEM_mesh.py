@@ -310,6 +310,10 @@ def p1_basis_functions(local_coords):
     eta = local_coords[1]
     return jnp.array([1.0 - xi - eta, xi, eta])
 
+def dp0_basis_functions(local_coords):
+    """Evaluate DP0 basis function. Returns [1, Q] — constant 1 over element."""
+    return jnp.ones((1, local_coords.shape[1]))
+
 def get_triangle_quadrature(order=4):
     """Get quadrature points [2, Q] and weights [Q].
 

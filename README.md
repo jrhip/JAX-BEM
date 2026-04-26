@@ -44,6 +44,11 @@ or
 The domain potential operator is the combined single layer and double layer. 
 (See JAX_BEM_kirchoff_helmholtz.py)
 
+# Implemented discretisation schemes
+
+* P1 (continuous polynomial)
+* DP0 (discontinuous polynomial)
+
 # Citation
 
 ```

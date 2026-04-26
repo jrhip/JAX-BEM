@@ -2,6 +2,22 @@ import jax.numpy as jnp
 from jax import jit
 from functools import partial
 
+
+def _eval_basis(space, quad_pts):
+    """Evaluate basis functions [n_local, N] at reference quadrature points [2, N].
+
+    Called only inside JIT-compiled functions with 'space' as a static arg,
+    so the if/else is resolved at compile time — no runtime overhead.
+    """
+    if space == 'P1':
+        return jnp.stack([
+            1.0 - quad_pts[0] - quad_pts[1],
+            quad_pts[0],
+            quad_pts[1],
+        ], axis=0)  # [3, N]
+    else:  # DP0
+        return jnp.ones((1, quad_pts.shape[1]))  # [1, N]
+
 #%% Reference Coordinate Remapping Functions
 # These transform quadrature points when the shared vertex/edge is not at
 # the standard position assumed by the Duffy rules.
@@ -528,12 +544,13 @@ def get_remapped_vertex_adjacent_rule(order, test_shared_vertex, trial_shared_ve
 
 #%% Coincident local matrix computations
 
-@partial(jit, static_argnames=['order'])
+@partial(jit, static_argnames=['order', 'space'])
 def compute_coincident_double_layer_matrix(
     vertices,    # [3, 3] - three vertices of the triangle (vertex i is vertices[i])
     normal,      # [3] - element normal
     k0,          # wavenumber (real)
-    order=4      # quadrature order per dimension
+    order=4,     # quadrature order per dimension
+    space='P1',  # function space identifier
     ):
     """
     Compute local 3x3 double layer matrix for a coincident (self) element.
@@ -593,31 +610,17 @@ def compute_coincident_double_layer_matrix(
     # Weighted kernel values
     weighted_kernel = kernel_vals * full_weights  # [N]
     
-    # Evaluate basis functions at quadrature points
-    # P1 basis: phi_0 = 1 - xi - eta, phi_1 = xi, phi_2 = eta
-    basis_test = jnp.stack([
-        1.0 - points_test[0] - points_test[1],
-        points_test[0],
-        points_test[1]
-    ], axis=0)  # [3, N]
-    
-    basis_trial = jnp.stack([
-        1.0 - points_trial[0] - points_trial[1],
-        points_trial[0],
-        points_trial[1]
-    ], axis=0)  # [3, N]
-    
-    # Integrate: local[i,j] = sum_q basis_test[i,q] * basis_trial[j,q] * weighted_kernel[q]
-    local_matrix = jnp.einsum('in,jn,n->ij', basis_test, basis_trial, weighted_kernel)
-    
-    return local_matrix
+    basis_test  = _eval_basis(space, points_test)   # [n_local, N]
+    basis_trial = _eval_basis(space, points_trial)  # [n_local, N]
+    return jnp.einsum('in,jn,n->ij', basis_test, basis_trial, weighted_kernel)
 
-@partial(jit, static_argnames=['order'])
+@partial(jit, static_argnames=['order', 'space'])
 def compute_coincident_hypersingular_matrix(
     vertices,    # [3, 3] - three vertices of the triangle (vertex i is vertices[i])
     normal,      # [3] - element normal
     k0,          # wavenumber (real)
-    order=4      # quadrature order per dimension
+    order=4,     # quadrature order per dimension
+    space='P1',  # function space identifier
     ):
     """
     Compute local 3x3 hypersingular matrix for a coincident (self) element.
@@ -647,93 +650,57 @@ def compute_coincident_hypersingular_matrix(
     cross = jnp.cross(e1, e2)
     int_elem = jnp.linalg.norm(cross) / 2.0
     
-    # Inverse transpose of Jacobian for gradient transformation
-    # For surface gradients: grad_phys = J^{-T} @ grad_ref
-    # J is [3, 2], so we need the pseudo-inverse
-    # J^+ = (J^T J)^{-1} J^T
-    JTJ = jacobian.T @ jacobian  # [2, 2]
-    JTJ_inv = jnp.linalg.inv(JTJ)
-    jac_inv_trans = jacobian @ JTJ_inv  # [3, 2]
-    
-    # Reference gradients of P1 basis functions (constant)
-    # phi_0 = 1 - xi - eta  =>  grad_ref = [-1, -1]
-    # phi_1 = xi            =>  grad_ref = [1, 0]
-    # phi_2 = eta           =>  grad_ref = [0, 1]
-    ref_gradients = jnp.array([
-        [-1.0, -1.0],
-        [1.0, 0.0],
-        [0.0, 1.0]
-    ])  # [3 basis, 2 ref coords]
-    
-    # Physical surface gradients [3 basis, 3 phys coords]
-    surface_gradients = ref_gradients @ jac_inv_trans.T
-    
-    # Surface curls: curl_s(phi) = n × grad_s(phi)
-    # surface_curls[i] = cross(normal, surface_gradients[i])
-    surface_curls = jnp.cross(normal[None, :], surface_gradients)  # [3, 3]
-    
-    # Curl-curl product matrix (constant over quadrature points)
-    # curl_product[i,j] = surface_curls[i] · surface_curls[j]
-    curl_product = surface_curls @ surface_curls.T  # [3, 3]
-    
-    # Normal product (for coincident elements, n_test · n_trial = 1)
+    # Curl-curl term: present only for P1 (constant basis has zero surface gradient)
+    if space == 'P1':
+        JTJ = jacobian.T @ jacobian
+        JTJ_inv = jnp.linalg.inv(JTJ)
+        jac_inv_trans = jacobian @ JTJ_inv  # [3, 2]
+        ref_gradients = jnp.array([[-1.0, -1.0], [1.0, 0.0], [0.0, 1.0]])
+        surface_gradients = ref_gradients @ jac_inv_trans.T
+        surface_curls = jnp.cross(normal[None, :], surface_gradients)  # [3, 3]
+        curl_product = surface_curls @ surface_curls.T                  # [3, 3]
+
+    # Normal product (coincident: same element)
     normal_prod = 1.0
-    
+
     # Physical points
-    phys_test = v0[None, :] + points_test[0, :, None] * e1[None, :] + points_test[1, :, None] * e2[None, :]
+    phys_test  = v0[None, :] + points_test[0,  :, None] * e1[None, :] + points_test[1,  :, None] * e2[None, :]
     phys_trial = v0[None, :] + points_trial[0, :, None] * e1[None, :] + points_trial[1, :, None] * e2[None, :]
-    
-    # Single layer kernel (used by bempp for hypersingular operator)
+
+    # Single layer kernel
     diff = phys_test - phys_trial
     dist = jnp.sqrt(jnp.sum(diff * diff, axis=1))
-
     M_INV_4PI = 1.0 / (4.0 * jnp.pi)
-
     phase = jnp.exp(1j * k0 * dist)
     kernel_vals = phase * M_INV_4PI / dist
-    
-    # Full quadrature weights
+
     full_weights = weights * int_elem * int_elem * 4.0
     weighted_kernel = kernel_vals * full_weights
-    
-    # Basis function values
-    basis_test = jnp.stack([
-        1.0 - points_test[0] - points_test[1],
-        points_test[0],
-        points_test[1]
-    ], axis=0)  # [3, N]
-    
-    basis_trial = jnp.stack([
-        1.0 - points_trial[0] - points_trial[1],
-        points_trial[0],
-        points_trial[1]
-    ], axis=0)  # [3, N]
-    
-    # Hypersingular has two terms:
-    # 1. Curl-curl term: curl_product[i,j] * sum_q(kernel * weight)
-    # 2. Mass term: -k² * normal_prod * sum_q(phi_i * phi_j * kernel * weight)
-    
-    kernel_sum = jnp.sum(weighted_kernel)
-    curl_term = kernel_sum * curl_product
-    
+
+    basis_test  = _eval_basis(space, points_test)   # [n_local, N]
+    basis_trial = _eval_basis(space, points_trial)  # [n_local, N]
     mass_term = jnp.einsum('in,jn,n->ij', basis_test, basis_trial, weighted_kernel)
-    
-    local_matrix = curl_term - k0**2 * normal_prod * mass_term
 
-    return local_matrix
+    if space == 'P1':
+        curl_term = jnp.sum(weighted_kernel) * curl_product
+    else:  # DP0: surface curl of constant basis is zero
+        curl_term = jnp.zeros((1, 1))
 
-@partial(jit, static_argnames=['order'])
+    return curl_term - k0**2 * normal_prod * mass_term
+
+@partial(jit, static_argnames=['order', 'space'])
 def compute_edge_adjacent_double_layer_matrix(
-    test_vertices,  # [3, 3] - test triangle vertices
-    trial_vertices, # [3, 3] - trial triangle vertices
-    test_normal,    # [3] - test element normal
-    trial_normal,   # [3] - trial element normal
-    k0,             # wavenumber
-    test_shared_v1, # local index of first shared vertex in test element
-    test_shared_v2, # local index of second shared vertex in test element
+    test_vertices,   # [3, 3] - test triangle vertices
+    trial_vertices,  # [3, 3] - trial triangle vertices
+    test_normal,     # [3] - test element normal
+    trial_normal,    # [3] - trial element normal
+    k0,              # wavenumber
+    test_shared_v1,  # local index of first shared vertex in test element
+    test_shared_v2,  # local index of second shared vertex in test element
     trial_shared_v1, # local index of first shared vertex in trial element
     trial_shared_v2, # local index of second shared vertex in trial element
-    order=4
+    order=4,
+    space='P1',
     ):
     """
     Compute local 3x3 double layer matrix for edge-adjacent elements.
@@ -778,34 +745,21 @@ def compute_edge_adjacent_double_layer_matrix(
     full_weights = weights * int_elem_test * int_elem_trial * 4.0
     weighted_kernel = kernel_vals * full_weights
 
-    # Basis functions
-    basis_test = jnp.stack([
-        1.0 - points_test[0] - points_test[1],
-        points_test[0],
-        points_test[1]
-    ], axis=0)
+    basis_test  = _eval_basis(space, points_test)
+    basis_trial = _eval_basis(space, points_trial)
+    return jnp.einsum('in,jn,n->ij', basis_test, basis_trial, weighted_kernel)
 
-    basis_trial = jnp.stack([
-        1.0 - points_trial[0] - points_trial[1],
-        points_trial[0],
-        points_trial[1]
-    ], axis=0)
-
-    # Assemble local matrix
-    local_matrix = jnp.einsum('in,jn,n->ij', basis_test, basis_trial, weighted_kernel)
-
-    return local_matrix
-
-@partial(jit, static_argnames=['order'])
+@partial(jit, static_argnames=['order', 'space'])
 def compute_vertex_adjacent_double_layer_matrix(
-    test_vertices,  # [3, 3] - test triangle vertices
-    trial_vertices, # [3, 3] - trial triangle vertices
-    test_normal,    # [3] - test element normal
-    trial_normal,   # [3] - trial element normal
-    k0,             # wavenumber
+    test_vertices,       # [3, 3] - test triangle vertices
+    trial_vertices,      # [3, 3] - trial triangle vertices
+    test_normal,         # [3] - test element normal
+    trial_normal,        # [3] - trial element normal
+    k0,                  # wavenumber
     test_shared_vertex,  # local index of shared vertex in test element
     trial_shared_vertex, # local index of shared vertex in trial element
-    order=4
+    order=4,
+    space='P1',
     ):
     """
     Compute local 3x3 double layer matrix for vertex-adjacent elements.
@@ -850,33 +804,20 @@ def compute_vertex_adjacent_double_layer_matrix(
     full_weights = weights * int_elem_test * int_elem_trial * 4.0
     weighted_kernel = kernel_vals * full_weights
 
-    # Basis functions
-    basis_test = jnp.stack([
-        1.0 - points_test[0] - points_test[1],
-        points_test[0],
-        points_test[1]
-    ], axis=0)
-
-    basis_trial = jnp.stack([
-        1.0 - points_trial[0] - points_trial[1],
-        points_trial[0],
-        points_trial[1]
-    ], axis=0)
-
-    # Assemble local matrix
-    local_matrix = jnp.einsum('in,jn,n->ij', basis_test, basis_trial, weighted_kernel)
-
-    return local_matrix
+    basis_test  = _eval_basis(space, points_test)
+    basis_trial = _eval_basis(space, points_trial)
+    return jnp.einsum('in,jn,n->ij', basis_test, basis_trial, weighted_kernel)
 
 
 #%% Adjoint Double Layer Singular Matrices
 
-@partial(jit, static_argnames=['order'])
+@partial(jit, static_argnames=['order', 'space'])
 def compute_coincident_adjoint_double_layer_matrix(
-    vertices,  # [3, 3] - three vertices of the triangle
-    normal,    # [3] - element normal
-    k0,        # wavenumber
-    order=4
+    vertices,   # [3, 3] - three vertices of the triangle
+    normal,     # [3] - element normal
+    k0,         # wavenumber
+    order=4,
+    space='P1',
     ):
     """
     Compute local 3x3 adjoint double layer matrix for a coincident (self) element.
@@ -910,13 +851,12 @@ def compute_coincident_adjoint_double_layer_matrix(
     full_weights = weights * int_elem * int_elem * 4.0
     weighted_kernel = kernel_vals * full_weights
 
-    basis_test  = jnp.stack([1.0 - points_test[0]  - points_test[1],  points_test[0],  points_test[1]],  axis=0)
-    basis_trial = jnp.stack([1.0 - points_trial[0] - points_trial[1], points_trial[0], points_trial[1]], axis=0)
-
+    basis_test  = _eval_basis(space, points_test)
+    basis_trial = _eval_basis(space, points_trial)
     return jnp.einsum('in,jn,n->ij', basis_test, basis_trial, weighted_kernel)
 
 
-@partial(jit, static_argnames=['order'])
+@partial(jit, static_argnames=['order', 'space'])
 def compute_edge_adjacent_adjoint_double_layer_matrix(
     test_vertices,   # [3, 3]
     trial_vertices,  # [3, 3]
@@ -927,7 +867,8 @@ def compute_edge_adjacent_adjoint_double_layer_matrix(
     test_shared_v2,
     trial_shared_v1,
     trial_shared_v2,
-    order=4
+    order=4,
+    space='P1',
     ):
     """
     Compute local 3x3 adjoint double layer matrix for edge-adjacent elements.
@@ -963,13 +904,12 @@ def compute_edge_adjacent_adjoint_double_layer_matrix(
     full_weights = weights * int_elem_test * int_elem_trial * 4.0
     weighted_kernel = kernel_vals * full_weights
 
-    basis_test  = jnp.stack([1.0 - points_test[0]  - points_test[1],  points_test[0],  points_test[1]],  axis=0)
-    basis_trial = jnp.stack([1.0 - points_trial[0] - points_trial[1], points_trial[0], points_trial[1]], axis=0)
-
+    basis_test  = _eval_basis(space, points_test)
+    basis_trial = _eval_basis(space, points_trial)
     return jnp.einsum('in,jn,n->ij', basis_test, basis_trial, weighted_kernel)
 
 
-@partial(jit, static_argnames=['order'])
+@partial(jit, static_argnames=['order', 'space'])
 def compute_vertex_adjacent_adjoint_double_layer_matrix(
     test_vertices,       # [3, 3]
     trial_vertices,      # [3, 3]
@@ -978,7 +918,8 @@ def compute_vertex_adjacent_adjoint_double_layer_matrix(
     k0,
     test_shared_vertex,
     trial_shared_vertex,
-    order=4
+    order=4,
+    space='P1',
     ):
     """
     Compute local 3x3 adjoint double layer matrix for vertex-adjacent elements.
@@ -1014,24 +955,24 @@ def compute_vertex_adjacent_adjoint_double_layer_matrix(
     full_weights = weights * int_elem_test * int_elem_trial * 4.0
     weighted_kernel = kernel_vals * full_weights
 
-    basis_test  = jnp.stack([1.0 - points_test[0]  - points_test[1],  points_test[0],  points_test[1]],  axis=0)
-    basis_trial = jnp.stack([1.0 - points_trial[0] - points_trial[1], points_trial[0], points_trial[1]], axis=0)
-
+    basis_test  = _eval_basis(space, points_test)
+    basis_trial = _eval_basis(space, points_trial)
     return jnp.einsum('in,jn,n->ij', basis_test, basis_trial, weighted_kernel)
 
 
-@partial(jit, static_argnames=['order'])
+@partial(jit, static_argnames=['order', 'space'])
 def compute_edge_adjacent_hypersingular_matrix(
-    test_vertices,  # [3, 3] - test triangle vertices
-    trial_vertices, # [3, 3] - trial triangle vertices
-    test_normal,    # [3] - test element normal
-    trial_normal,   # [3] - trial element normal
-    k0,             # wavenumber
+    test_vertices,   # [3, 3] - test triangle vertices
+    trial_vertices,  # [3, 3] - trial triangle vertices
+    test_normal,     # [3] - test element normal
+    trial_normal,    # [3] - trial element normal
+    k0,              # wavenumber
     test_shared_v1,  # local index of first shared vertex in test element
     test_shared_v2,  # local index of second shared vertex in test element
     trial_shared_v1, # local index of first shared vertex in trial element
     trial_shared_v2, # local index of second shared vertex in trial element
-    order=4
+    order=4,
+    space='P1',
     ):
     """
     Compute local 3x3 hypersingular matrix for edge-adjacent elements.
@@ -1060,68 +1001,52 @@ def compute_edge_adjacent_hypersingular_matrix(
     cross_trial = jnp.cross(e1_trial, e2_trial)
     int_elem_trial = jnp.linalg.norm(cross_trial) / 2.0
 
-    # Surface curls for test
-    JTJ_test_inv = jnp.linalg.inv(jacobian_test.T @ jacobian_test)
-    jac_inv_trans_test = jacobian_test @ JTJ_test_inv
-    ref_gradients = jnp.array([[-1.0, -1.0], [1.0, 0.0], [0.0, 1.0]])
-    surface_gradients_test = ref_gradients @ jac_inv_trans_test.T
-    surface_curls_test = jnp.cross(test_normal[None, :], surface_gradients_test)
-
-    # Surface curls for trial
-    JTJ_trial_inv = jnp.linalg.inv(jacobian_trial.T @ jacobian_trial)
-    jac_inv_trans_trial = jacobian_trial @ JTJ_trial_inv
-    surface_gradients_trial = ref_gradients @ jac_inv_trans_trial.T
-    surface_curls_trial = jnp.cross(trial_normal[None, :], surface_gradients_trial)
-
-    # Curl product
-    curl_product = surface_curls_test @ surface_curls_trial.T
+    if space == 'P1':
+        ref_gradients = jnp.array([[-1.0, -1.0], [1.0, 0.0], [0.0, 1.0]])
+        JTJ_test_inv = jnp.linalg.inv(jacobian_test.T @ jacobian_test)
+        surface_curls_test = jnp.cross(
+            test_normal[None, :],
+            ref_gradients @ (jacobian_test @ JTJ_test_inv).T)
+        JTJ_trial_inv = jnp.linalg.inv(jacobian_trial.T @ jacobian_trial)
+        surface_curls_trial = jnp.cross(
+            trial_normal[None, :],
+            ref_gradients @ (jacobian_trial @ JTJ_trial_inv).T)
+        curl_product = surface_curls_test @ surface_curls_trial.T  # [3, 3]
 
     # Physical points
-    phys_test = v0_test[None, :] + points_test[0, :, None] * e1_test[None, :] + points_test[1, :, None] * e2_test[None, :]
+    phys_test  = v0_test[None,  :] + points_test[0,  :, None] * e1_test[None,  :] + points_test[1,  :, None] * e2_test[None,  :]
     phys_trial = v0_trial[None, :] + points_trial[0, :, None] * e1_trial[None, :] + points_trial[1, :, None] * e2_trial[None, :]
 
-    # Single layer kernel (used by bempp for hypersingular operator)
     diff = phys_test - phys_trial
     dist = jnp.sqrt(jnp.sum(diff * diff, axis=1))
-
     M_INV_4PI = 1.0 / (4.0 * jnp.pi)
     phase = jnp.exp(1j * k0 * dist)
     kernel_vals = phase * M_INV_4PI / dist
 
-    # Full quadrature weights
     full_weights = weights * int_elem_test * int_elem_trial * 4.0
     weighted_kernel = kernel_vals * full_weights
 
-    # Basis functions
-    basis_test = jnp.stack([
-        1.0 - points_test[0] - points_test[1],
-        points_test[0],
-        points_test[1]
-    ], axis=0)
-
-    basis_trial = jnp.stack([
-        1.0 - points_trial[0] - points_trial[1],
-        points_trial[0],
-        points_trial[1]
-    ], axis=0)
-
-    # Hypersingular formula
-    kernel_sum = jnp.sum(weighted_kernel)
-    curl_term = kernel_sum * curl_product
+    basis_test  = _eval_basis(space, points_test)
+    basis_trial = _eval_basis(space, points_trial)
     normal_prod = jnp.dot(test_normal, trial_normal)
     mass_term = jnp.einsum('in,jn,n->ij', basis_test, basis_trial, weighted_kernel)
-    local_matrix = curl_term - k0**2 * normal_prod * mass_term
 
-    return local_matrix
+    if space == 'P1':
+        curl_term = jnp.sum(weighted_kernel) * curl_product
+    else:
+        curl_term = jnp.zeros((1, 1))
+
+    return curl_term - k0**2 * normal_prod * mass_term
 
 
 #%% Single Layer Singular Matrices
 
-@partial(jit, static_argnames=['order'])
+@partial(jit, static_argnames=['order', 'space'])
 def compute_coincident_single_layer_matrix(
-    vertices,    # [3, 3] - three vertices of the triangle
-    k0,          # wavenumber
-    order=4
+    vertices,   # [3, 3] - three vertices of the triangle
+    k0,         # wavenumber
+    order=4,
+    space='P1',
     ):
     """
     Compute local 3x3 single layer matrix for a coincident (self) element.
@@ -1151,19 +1076,12 @@ def compute_coincident_single_layer_matrix(
     full_weights = weights * int_elem * int_elem * 4.0
     weighted_kernel = kernel_vals * full_weights
 
-    basis_test = jnp.stack([
-        1.0 - points_test[0]  - points_test[1],
-        points_test[0],  points_test[1]
-    ], axis=0)
-    basis_trial = jnp.stack([
-        1.0 - points_trial[0] - points_trial[1],
-        points_trial[0], points_trial[1]
-    ], axis=0)
-
+    basis_test  = _eval_basis(space, points_test)
+    basis_trial = _eval_basis(space, points_trial)
     return jnp.einsum('in,jn,n->ij', basis_test, basis_trial, weighted_kernel)
 
 
-@partial(jit, static_argnames=['order'])
+@partial(jit, static_argnames=['order', 'space'])
 def compute_edge_adjacent_single_layer_matrix(
     test_vertices,   # [3, 3]
     trial_vertices,  # [3, 3]
@@ -1172,7 +1090,8 @@ def compute_edge_adjacent_single_layer_matrix(
     test_shared_v2,
     trial_shared_v1,
     trial_shared_v2,
-    order=4
+    order=4,
+    space='P1',
     ):
     """
     Compute local 3x3 single layer matrix for edge-adjacent elements.
@@ -1206,26 +1125,20 @@ def compute_edge_adjacent_single_layer_matrix(
     full_weights = weights * int_elem_test * int_elem_trial * 4.0
     weighted_kernel = kernel_vals * full_weights
 
-    basis_test = jnp.stack([
-        1.0 - points_test[0]  - points_test[1],
-        points_test[0],  points_test[1]
-    ], axis=0)
-    basis_trial = jnp.stack([
-        1.0 - points_trial[0] - points_trial[1],
-        points_trial[0], points_trial[1]
-    ], axis=0)
-
+    basis_test  = _eval_basis(space, points_test)
+    basis_trial = _eval_basis(space, points_trial)
     return jnp.einsum('in,jn,n->ij', basis_test, basis_trial, weighted_kernel)
 
 
-@partial(jit, static_argnames=['order'])
+@partial(jit, static_argnames=['order', 'space'])
 def compute_vertex_adjacent_single_layer_matrix(
-    test_vertices,   # [3, 3]
-    trial_vertices,  # [3, 3]
+    test_vertices,       # [3, 3]
+    trial_vertices,      # [3, 3]
     k0,
     test_shared_vertex,
     trial_shared_vertex,
-    order=4
+    order=4,
+    space='P1',
     ):
     """
     Compute local 3x3 single layer matrix for vertex-adjacent elements.
@@ -1259,27 +1172,21 @@ def compute_vertex_adjacent_single_layer_matrix(
     full_weights = weights * int_elem_test * int_elem_trial * 4.0
     weighted_kernel = kernel_vals * full_weights
 
-    basis_test = jnp.stack([
-        1.0 - points_test[0]  - points_test[1],
-        points_test[0],  points_test[1]
-    ], axis=0)
-    basis_trial = jnp.stack([
-        1.0 - points_trial[0] - points_trial[1],
-        points_trial[0], points_trial[1]
-    ], axis=0)
-
+    basis_test  = _eval_basis(space, points_test)
+    basis_trial = _eval_basis(space, points_trial)
     return jnp.einsum('in,jn,n->ij', basis_test, basis_trial, weighted_kernel)
 
-@partial(jit, static_argnames=['order'])
+@partial(jit, static_argnames=['order', 'space'])
 def compute_vertex_adjacent_hypersingular_matrix(
-    test_vertices,  # [3, 3] - test triangle vertices
-    trial_vertices, # [3, 3] - trial triangle vertices
-    test_normal,    # [3] - test element normal
-    trial_normal,   # [3] - trial element normal
-    k0,             # wavenumber
+    test_vertices,       # [3, 3] - test triangle vertices
+    trial_vertices,      # [3, 3] - trial triangle vertices
+    test_normal,         # [3] - test element normal
+    trial_normal,        # [3] - trial element normal
+    k0,                  # wavenumber
     test_shared_vertex,  # local index of shared vertex in test element
     trial_shared_vertex, # local index of shared vertex in trial element
-    order=4
+    order=4,
+    space='P1',
     ):
     """
     Compute local 3x3 hypersingular matrix for vertex-adjacent elements.
@@ -1308,56 +1215,39 @@ def compute_vertex_adjacent_hypersingular_matrix(
     cross_trial = jnp.cross(e1_trial, e2_trial)
     int_elem_trial = jnp.linalg.norm(cross_trial) / 2.0
 
-    # Surface curls for test
-    JTJ_test_inv = jnp.linalg.inv(jacobian_test.T @ jacobian_test)
-    jac_inv_trans_test = jacobian_test @ JTJ_test_inv
-    ref_gradients = jnp.array([[-1.0, -1.0], [1.0, 0.0], [0.0, 1.0]])
-    surface_gradients_test = ref_gradients @ jac_inv_trans_test.T
-    surface_curls_test = jnp.cross(test_normal[None, :], surface_gradients_test)
-
-    # Surface curls for trial
-    JTJ_trial_inv = jnp.linalg.inv(jacobian_trial.T @ jacobian_trial)
-    jac_inv_trans_trial = jacobian_trial @ JTJ_trial_inv
-    surface_gradients_trial = ref_gradients @ jac_inv_trans_trial.T
-    surface_curls_trial = jnp.cross(trial_normal[None, :], surface_gradients_trial)
-
-    # Curl product
-    curl_product = surface_curls_test @ surface_curls_trial.T
+    if space == 'P1':
+        ref_gradients = jnp.array([[-1.0, -1.0], [1.0, 0.0], [0.0, 1.0]])
+        JTJ_test_inv = jnp.linalg.inv(jacobian_test.T @ jacobian_test)
+        surface_curls_test = jnp.cross(
+            test_normal[None, :],
+            ref_gradients @ (jacobian_test @ JTJ_test_inv).T)
+        JTJ_trial_inv = jnp.linalg.inv(jacobian_trial.T @ jacobian_trial)
+        surface_curls_trial = jnp.cross(
+            trial_normal[None, :],
+            ref_gradients @ (jacobian_trial @ JTJ_trial_inv).T)
+        curl_product = surface_curls_test @ surface_curls_trial.T  # [3, 3]
 
     # Physical points
-    phys_test = v0_test[None, :] + points_test[0, :, None] * e1_test[None, :] + points_test[1, :, None] * e2_test[None, :]
+    phys_test  = v0_test[None,  :] + points_test[0,  :, None] * e1_test[None,  :] + points_test[1,  :, None] * e2_test[None,  :]
     phys_trial = v0_trial[None, :] + points_trial[0, :, None] * e1_trial[None, :] + points_trial[1, :, None] * e2_trial[None, :]
 
-    # Single layer kernel (used by bempp for hypersingular operator)
     diff = phys_test - phys_trial
     dist = jnp.sqrt(jnp.sum(diff * diff, axis=1))
-
     M_INV_4PI = 1.0 / (4.0 * jnp.pi)
     phase = jnp.exp(1j * k0 * dist)
     kernel_vals = phase * M_INV_4PI / dist
 
-    # Full quadrature weights
     full_weights = weights * int_elem_test * int_elem_trial * 4.0
     weighted_kernel = kernel_vals * full_weights
 
-    # Basis functions
-    basis_test = jnp.stack([
-        1.0 - points_test[0] - points_test[1],
-        points_test[0],
-        points_test[1]
-    ], axis=0)
-
-    basis_trial = jnp.stack([
-        1.0 - points_trial[0] - points_trial[1],
-        points_trial[0],
-        points_trial[1]
-    ], axis=0)
-
-    # Hypersingular formula
-    kernel_sum = jnp.sum(weighted_kernel)
-    curl_term = kernel_sum * curl_product
+    basis_test  = _eval_basis(space, points_test)
+    basis_trial = _eval_basis(space, points_trial)
     normal_prod = jnp.dot(test_normal, trial_normal)
     mass_term = jnp.einsum('in,jn,n->ij', basis_test, basis_trial, weighted_kernel)
-    local_matrix = curl_term - k0**2 * normal_prod * mass_term
 
-    return local_matrix
+    if space == 'P1':
+        curl_term = jnp.sum(weighted_kernel) * curl_product
+    else:
+        curl_term = jnp.zeros((1, 1))
+
+    return curl_term - k0**2 * normal_prod * mass_term

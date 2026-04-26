@@ -18,6 +18,7 @@ from core.JAX_BEM_mesh import (compute_jacobians,
                             compute_integration_elements,
                             compute_surface_curls,
                             p1_basis_functions,
+                            dp0_basis_functions,
                             get_triangle_quadrature,
                             compute_element_quadrature_points
                             )
@@ -159,58 +160,48 @@ def get_active_reflections(symmetry_tuple):
 
 #%% Mass Matrix Assembly (Identity Operator Weak Form)
 
-@partial(jit, static_argnames=['quad_order'])
-def assemble_mass_matrix(vertices, faces, quad_order=4):
+@partial(jit, static_argnames=['quad_order', 'space'])
+def assemble_mass_matrix(vertices, faces, quad_order=4, space='P1'):
     """
     Assemble the mass matrix (weak form of the identity operator).
 
-    This is the Galerkin discretization of the identity: M_ij = ∫ φ_i φ_j dS
-
-    In BEM terminology:
-    - identity.weak_form() = mass matrix M
-    - identity.strong_form() = M^{-1} @ M = I (the actual identity matrix)
+    M_ij = ∫ φ_i φ_j dS
 
     Args:
-        vertices: [N, 3] vertex positions
-        faces: [F, 3] triangle connectivity
+        vertices:   [N, 3] vertex positions
+        faces:      [F, 3] triangle connectivity
         quad_order: quadrature order (1, 3, 4, or 7). Default 4 matches bempp.
+        space:      'P1' (default) or 'DP0'
 
     Returns:
-        mass_matrix: [N, N] mass matrix (sparse structure, stored dense)
+        mass_matrix: [n_dofs, n_dofs] mass matrix (dense)
     """
-    n_verts = vertices.shape[0]
     n_faces = faces.shape[0]
+    n_local = 3 if space == 'P1' else 1
+    n_dofs  = vertices.shape[0] if space == 'P1' else n_faces
+
+    if space == 'P1':
+        local2global = faces                                              # [F, 3]
+        basis_vals = p1_basis_functions(get_triangle_quadrature(quad_order)[0])
+    else:
+        local2global = jnp.arange(n_faces, dtype=jnp.int32)[:, None]    # [F, 1]
+        basis_vals = dp0_basis_functions(get_triangle_quadrature(quad_order)[0])
 
     quad_points, quad_weights = get_triangle_quadrature(quad_order)
-    basis_vals = p1_basis_functions(quad_points)  # [3, Q]
-
     jacobians = compute_jacobians(vertices, faces)
     integration_elements = compute_integration_elements(jacobians)
 
-    # Local mass matrix for each element
-    # M_ij^local = ∫_T φ_i φ_j dS = Σ_q w_q * φ_i(q) * φ_j(q) * |J|
     def compute_local_mass(elem_idx):
         int_elem = integration_elements[elem_idx]
-        # basis_vals: [3, Q], quad_weights: [Q]
-        # Weighted basis: [3, Q] with weights applied
-        weighted_basis = basis_vals * (quad_weights * int_elem)  # [3, Q]
-        # Local mass matrix: [3, 3] = [3, Q] @ [Q, 3]
-        return basis_vals @ weighted_basis.T
+        weighted_basis = basis_vals * (quad_weights * int_elem)
+        return basis_vals @ weighted_basis.T  # [n_local, n_local]
 
-    all_local = vmap(compute_local_mass)(jnp.arange(n_faces))  # [F, 3, 3]
+    all_local = vmap(compute_local_mass)(jnp.arange(n_faces))  # [F, n_local, n_local]
 
-    # Scatter to global matrix
-    mass = jnp.zeros((n_verts, n_verts), dtype=FLOAT_DTYPE)
-
-    # Build scatter indices: faces[f, i] and faces[f, j] for each local (i, j)
-    test_indices = faces[:, :, None]   # [F, 3, 1]
-    trial_indices = faces[:, None, :]  # [F, 1, 3]
-    test_indices = jnp.broadcast_to(test_indices, (n_faces, 3, 3)).ravel()
-    trial_indices = jnp.broadcast_to(trial_indices, (n_faces, 3, 3)).ravel()
-    values = all_local.ravel()
-
-    mass = mass.at[test_indices, trial_indices].add(values)
-
+    mass = jnp.zeros((n_dofs, n_dofs), dtype=FLOAT_DTYPE)
+    test_idx  = jnp.broadcast_to(local2global[:, :, None], (n_faces, n_local, n_local)).ravel()
+    trial_idx = jnp.broadcast_to(local2global[:, None, :], (n_faces, n_local, n_local)).ravel()
+    mass = mass.at[test_idx, trial_idx].add(all_local.ravel())
     return mass
 
 #%% Kernel Functions
@@ -458,30 +449,27 @@ def compute_adjoint_double_layer_local_matrix(test_elem_data, trial_elem_data, k
 #%% vmap Assembly
 
 def assemble_double_layer(vertices, faces, normals, k0, adjacency_data,
-                          quad_order=4, singular_order=4, symmetry=None):
+                          quad_order=4, singular_order=4, symmetry=None, space='P1'):
     """
-    Assemble double layer operator using vmap with separated singular/regular integration.
+    Assemble double layer operator K.
 
     Args:
-        vertices: [N, 3] vertex positions
-        faces: [F, 3] triangle connectivity
-        normals: [F, 3] element normals
-        k0: wavenumber
+        vertices:       [N, 3] vertex positions
+        faces:          [F, 3] triangle connectivity
+        normals:        [F, 3] element normals
+        k0:             wavenumber
         adjacency_data: pre-computed adjacency lists from compute_adjacency_lists()
-        quad_order: quadrature order for regular integration
+        quad_order:     quadrature order for regular integration
         singular_order: quadrature order for singular integration
-        symmetry: tuple/array of 3 bools for (XY, XZ, YZ) symmetry planes, or None for no symmetry
+        symmetry:       tuple/array of 3 bools for (XY, XZ, YZ) planes, or None
+        space:          'P1' (default) or 'DP0'
     """
     (regular_test_indices, regular_trial_indices,
      edge_test_indices, edge_trial_indices,
      vertex_test_indices, vertex_trial_indices,
      edge_shared_vertices, vertex_shared_vertices) = adjacency_data
 
-    # Convert symmetry to tuple for static arg (or default to no symmetry)
-    if symmetry is None:
-        symmetry_tuple = (False, False, False)
-    else:
-        symmetry_tuple = tuple(bool(s) for s in symmetry)
+    symmetry_tuple = (False, False, False) if symmetry is None else tuple(bool(s) for s in symmetry)
 
     return _assemble_double_layer_jit(
         vertices, faces, normals, k0,
@@ -489,36 +477,35 @@ def assemble_double_layer(vertices, faces, normals, k0, adjacency_data,
         edge_test_indices, edge_trial_indices,
         vertex_test_indices, vertex_trial_indices,
         edge_shared_vertices, vertex_shared_vertices,
-        quad_order, singular_order, symmetry_tuple
+        quad_order, singular_order, symmetry_tuple, space
     )
 
 
-@partial(jit, static_argnames=['quad_order', 'singular_order', 'symmetry'])
+@partial(jit, static_argnames=['quad_order', 'singular_order', 'symmetry', 'space'])
 def _assemble_double_layer_jit(vertices, faces, normals, k0,
                                 regular_test_indices, regular_trial_indices,
                                 edge_test_indices, edge_trial_indices,
                                 vertex_test_indices, vertex_trial_indices,
                                 edge_shared_vertices, vertex_shared_vertices,
-                                quad_order, singular_order, symmetry):
+                                quad_order, singular_order, symmetry, space):
     """JIT-compiled double layer assembly with pre-computed adjacency lists."""
-    n_verts = vertices.shape[0]
     n_faces = faces.shape[0]
+    n_local = 3 if space == 'P1' else 1
+    n_dofs  = vertices.shape[0] if space == 'P1' else n_faces
+    local2global = faces if space == 'P1' else jnp.arange(n_faces, dtype=jnp.int32)[:, None]
+
     n_regular_pairs = regular_test_indices.shape[0]
-    n_edge_pairs = edge_test_indices.shape[0]
-    n_vertex_pairs = vertex_test_indices.shape[0]
+    n_edge_pairs    = edge_test_indices.shape[0]
+    n_vertex_pairs  = vertex_test_indices.shape[0]
 
     quad_points, quad_weights = get_triangle_quadrature(quad_order)
-    basis_vals = p1_basis_functions(quad_points)
+    basis_vals = p1_basis_functions(quad_points) if space == 'P1' else dp0_basis_functions(quad_points)
 
-    # Precompute geometry
     jacobians = compute_jacobians(vertices, faces)
     integration_elements = compute_integration_elements(jacobians)
     phys_points = compute_element_quadrature_points(vertices, faces, jacobians, quad_points)
-
-    # Prepare data for vmap
     normals_at_quad = jnp.tile(normals[:, None, :], (1, len(quad_weights), 1))  # [F, Q, 3]
 
-    # Get active reflections at trace time (empty list if no symmetry)
     active_reflections = get_active_reflections(symmetry)
 
     # =========================================================================
@@ -547,174 +534,144 @@ def _assemble_double_layer_jit(vertices, faces, normals, k0,
     # but image contribution uses regular quadrature (reflected element is far)
     # =========================================================================
     def compute_coincident(elem_idx):
-        elem_verts = vertices[faces[elem_idx]]
+        elem_verts  = vertices[faces[elem_idx]]
         elem_normal = normals[elem_idx]
-        # Direct (singular)
-        result = compute_coincident_double_layer_matrix(elem_verts, elem_normal, k0, order=singular_order)
+        result = compute_coincident_double_layer_matrix(
+            elem_verts, elem_normal, k0, order=singular_order, space=space)
 
-        # Image contributions (regular quadrature - reflected element is far)
-        test_points = phys_points[elem_idx]
-        test_int_elem = integration_elements[elem_idx]
+        test_points    = phys_points[elem_idx]
+        test_int_elem  = integration_elements[elem_idx]
         trial_normals_q = normals_at_quad[elem_idx]
         trial_int_elem = integration_elements[elem_idx]
 
-        # Loop over active reflections (unrolls at trace time)
         for reflection in active_reflections:
-            reflected_trial_points = reflect_points(phys_points[elem_idx], reflection)
+            reflected_trial_points  = reflect_points(phys_points[elem_idx], reflection)
             reflected_trial_normals = reflect_normals(trial_normals_q, reflection)
             result = result + _compute_double_layer_contribution(
                 test_points, reflected_trial_points, reflected_trial_normals,
                 test_int_elem, trial_int_elem, k0, basis_vals, quad_weights)
-
         return result
 
-    coincident_matrices = vmap(compute_coincident)(jnp.arange(n_faces))  # [F, 3, 3]
+    coincident_matrices = vmap(compute_coincident)(jnp.arange(n_faces))
 
     # =========================================================================
     # STEP 3: Compute edge-adjacent singular contributions
     # =========================================================================
     def compute_edge_singular(pair_idx):
-        test_idx = edge_test_indices[pair_idx]
+        test_idx  = edge_test_indices[pair_idx]
         trial_idx = edge_trial_indices[pair_idx]
-
-        test_verts = vertices[faces[test_idx]]
-        trial_verts = vertices[faces[trial_idx]]
-        test_normal = normals[test_idx]
+        test_verts   = vertices[faces[test_idx]]
+        trial_verts  = vertices[faces[trial_idx]]
+        test_normal  = normals[test_idx]
         trial_normal = normals[trial_idx]
-
-        tv1 = edge_shared_vertices[pair_idx, 0]
-        tv2 = edge_shared_vertices[pair_idx, 1]
+        tv1  = edge_shared_vertices[pair_idx, 0]
+        tv2  = edge_shared_vertices[pair_idx, 1]
         trv1 = edge_shared_vertices[pair_idx, 2]
         trv2 = edge_shared_vertices[pair_idx, 3]
 
-        # Direct (singular)
         result = compute_edge_adjacent_double_layer_matrix(
             test_verts, trial_verts, test_normal, trial_normal, k0,
-            tv1, tv2, trv1, trv2, order=singular_order
-        )
+            tv1, tv2, trv1, trv2, order=singular_order, space=space)
 
-        # Image contributions (regular quadrature)
-        test_points = phys_points[test_idx]
-        test_int_elem = integration_elements[test_idx]
+        test_points    = phys_points[test_idx]
+        test_int_elem  = integration_elements[test_idx]
         trial_normals_q = normals_at_quad[trial_idx]
         trial_int_elem = integration_elements[trial_idx]
 
         for reflection in active_reflections:
-            reflected_trial_points = reflect_points(phys_points[trial_idx], reflection)
+            reflected_trial_points  = reflect_points(phys_points[trial_idx], reflection)
             reflected_trial_normals = reflect_normals(trial_normals_q, reflection)
             result = result + _compute_double_layer_contribution(
                 test_points, reflected_trial_points, reflected_trial_normals,
                 test_int_elem, trial_int_elem, k0, basis_vals, quad_weights)
-
         return result
 
-    edge_matrices = vmap(compute_edge_singular)(jnp.arange(n_edge_pairs))  # [n_edge, 3, 3]
+    edge_matrices = vmap(compute_edge_singular)(jnp.arange(n_edge_pairs))
 
     # =========================================================================
     # STEP 4: Compute vertex-adjacent singular contributions
     # =========================================================================
     def compute_vertex_singular(pair_idx):
-        test_idx = vertex_test_indices[pair_idx]
+        test_idx  = vertex_test_indices[pair_idx]
         trial_idx = vertex_trial_indices[pair_idx]
-
-        test_verts = vertices[faces[test_idx]]
-        trial_verts = vertices[faces[trial_idx]]
-        test_normal = normals[test_idx]
+        test_verts   = vertices[faces[test_idx]]
+        trial_verts  = vertices[faces[trial_idx]]
+        test_normal  = normals[test_idx]
         trial_normal = normals[trial_idx]
-
-        tv1 = vertex_shared_vertices[pair_idx, 0]
+        tv1  = vertex_shared_vertices[pair_idx, 0]
         trv1 = vertex_shared_vertices[pair_idx, 1]
 
-        # Direct (singular)
         result = compute_vertex_adjacent_double_layer_matrix(
             test_verts, trial_verts, test_normal, trial_normal, k0,
-            tv1, trv1, order=singular_order
-        )
+            tv1, trv1, order=singular_order, space=space)
 
-        # Image contributions (regular quadrature)
-        test_points = phys_points[test_idx]
-        test_int_elem = integration_elements[test_idx]
+        test_points    = phys_points[test_idx]
+        test_int_elem  = integration_elements[test_idx]
         trial_normals_q = normals_at_quad[trial_idx]
         trial_int_elem = integration_elements[trial_idx]
 
         for reflection in active_reflections:
-            reflected_trial_points = reflect_points(phys_points[trial_idx], reflection)
+            reflected_trial_points  = reflect_points(phys_points[trial_idx], reflection)
             reflected_trial_normals = reflect_normals(trial_normals_q, reflection)
             result = result + _compute_double_layer_contribution(
                 test_points, reflected_trial_points, reflected_trial_normals,
                 test_int_elem, trial_int_elem, k0, basis_vals, quad_weights)
-
         return result
 
-    vertex_matrices = vmap(compute_vertex_singular)(jnp.arange(n_vertex_pairs))  # [n_vertex, 3, 3]
+    vertex_matrices = vmap(compute_vertex_singular)(jnp.arange(n_vertex_pairs))
 
     # =========================================================================
     # STEP 5: Scatter all contributions to global matrix
     # =========================================================================
-    operator = jnp.zeros((n_verts, n_verts), dtype=COMPLEX_DTYPE)
+    operator = jnp.zeros((n_dofs, n_dofs), dtype=COMPLEX_DTYPE)
 
-    # Scatter regular contributions (non-adjacent pairs)
-    regular_test_faces = faces[regular_test_indices]  # [n_regular, 3]
-    regular_trial_faces = faces[regular_trial_indices]  # [n_regular, 3]
-    regular_test_dofs = regular_test_faces[:, :, None]  # [n_regular, 3, 1]
-    regular_trial_dofs = regular_trial_faces[:, None, :]  # [n_regular, 1, 3]
-    regular_test_idx = jnp.broadcast_to(regular_test_dofs, (n_regular_pairs, 3, 3)).ravel()
-    regular_trial_idx = jnp.broadcast_to(regular_trial_dofs, (n_regular_pairs, 3, 3)).ravel()
-    operator = operator.at[regular_test_idx, regular_trial_idx].add(regular_matrices.ravel())
+    reg_test_l2g  = local2global[regular_test_indices]   # [n_regular, n_local]
+    reg_trial_l2g = local2global[regular_trial_indices]  # [n_regular, n_local]
+    reg_test_idx  = jnp.broadcast_to(reg_test_l2g[:, :, None], (n_regular_pairs, n_local, n_local)).ravel()
+    reg_trial_idx = jnp.broadcast_to(reg_trial_l2g[:, None, :], (n_regular_pairs, n_local, n_local)).ravel()
+    operator = operator.at[reg_test_idx, reg_trial_idx].add(regular_matrices.ravel())
 
-    # Scatter coincident contributions (diagonal)
-    diag_test_dofs = faces[:, :, None]
-    diag_trial_dofs = faces[:, None, :]
-    diag_test_indices = jnp.broadcast_to(diag_test_dofs, (n_faces, 3, 3)).ravel()
-    diag_trial_indices = jnp.broadcast_to(diag_trial_dofs, (n_faces, 3, 3)).ravel()
-    operator = operator.at[diag_test_indices, diag_trial_indices].add(coincident_matrices.ravel())
+    diag_test_idx  = jnp.broadcast_to(local2global[:, :, None], (n_faces, n_local, n_local)).ravel()
+    diag_trial_idx = jnp.broadcast_to(local2global[:, None, :], (n_faces, n_local, n_local)).ravel()
+    operator = operator.at[diag_test_idx, diag_trial_idx].add(coincident_matrices.ravel())
 
-    # Scatter edge-adjacent singular contributions
-    edge_test_faces = faces[edge_test_indices]
-    edge_trial_faces = faces[edge_trial_indices]
-    edge_test_dofs = edge_test_faces[:, :, None]
-    edge_trial_dofs = edge_trial_faces[:, None, :]
-    edge_test_idx = jnp.broadcast_to(edge_test_dofs, (n_edge_pairs, 3, 3)).ravel()
-    edge_trial_idx = jnp.broadcast_to(edge_trial_dofs, (n_edge_pairs, 3, 3)).ravel()
+    edge_test_l2g  = local2global[edge_test_indices]
+    edge_trial_l2g = local2global[edge_trial_indices]
+    edge_test_idx  = jnp.broadcast_to(edge_test_l2g[:, :, None], (n_edge_pairs, n_local, n_local)).ravel()
+    edge_trial_idx = jnp.broadcast_to(edge_trial_l2g[:, None, :], (n_edge_pairs, n_local, n_local)).ravel()
     operator = operator.at[edge_test_idx, edge_trial_idx].add(edge_matrices.ravel())
 
-    # Scatter vertex-adjacent singular contributions
-    vertex_test_faces = faces[vertex_test_indices]
-    vertex_trial_faces = faces[vertex_trial_indices]
-    vertex_test_dofs = vertex_test_faces[:, :, None]
-    vertex_trial_dofs = vertex_trial_faces[:, None, :]
-    vertex_test_idx = jnp.broadcast_to(vertex_test_dofs, (n_vertex_pairs, 3, 3)).ravel()
-    vertex_trial_idx = jnp.broadcast_to(vertex_trial_dofs, (n_vertex_pairs, 3, 3)).ravel()
-    operator = operator.at[vertex_test_idx, vertex_trial_idx].add(vertex_matrices.ravel())
+    vert_test_l2g  = local2global[vertex_test_indices]
+    vert_trial_l2g = local2global[vertex_trial_indices]
+    vert_test_idx  = jnp.broadcast_to(vert_test_l2g[:, :, None], (n_vertex_pairs, n_local, n_local)).ravel()
+    vert_trial_idx = jnp.broadcast_to(vert_trial_l2g[:, None, :], (n_vertex_pairs, n_local, n_local)).ravel()
+    operator = operator.at[vert_test_idx, vert_trial_idx].add(vertex_matrices.ravel())
 
     return operator
 
 
 def assemble_hypersingular(vertices, faces, normals, k0, adjacency_data,
-                           quad_order=4, singular_order=4, symmetry=None):
+                           quad_order=4, singular_order=4, symmetry=None, space='P1'):
     """
-    Assemble hypersingular operator using vmap with separated singular/regular integration.
+    Assemble hypersingular operator W.
 
     Args:
-        vertices: [N, 3] vertex positions
-        faces: [F, 3] triangle connectivity
-        normals: [F, 3] element normals
-        k0: wavenumber
+        vertices:       [N, 3] vertex positions
+        faces:          [F, 3] triangle connectivity
+        normals:        [F, 3] element normals
+        k0:             wavenumber
         adjacency_data: pre-computed adjacency lists from compute_adjacency_lists()
-        quad_order: quadrature order for regular integration
+        quad_order:     quadrature order for regular integration
         singular_order: quadrature order for singular integration
-        symmetry: tuple/array of 3 bools for (XY, XZ, YZ) symmetry planes, or None for no symmetry
+        symmetry:       tuple/array of 3 bools for (XY, XZ, YZ) planes, or None
+        space:          'P1' (default) or 'DP0'
     """
     (regular_test_indices, regular_trial_indices,
      edge_test_indices, edge_trial_indices,
      vertex_test_indices, vertex_trial_indices,
      edge_shared_vertices, vertex_shared_vertices) = adjacency_data
 
-    # Convert symmetry to tuple for static arg (or default to no symmetry)
-    if symmetry is None:
-        symmetry_tuple = (False, False, False)
-    else:
-        symmetry_tuple = tuple(bool(s) for s in symmetry)
+    symmetry_tuple = (False, False, False) if symmetry is None else tuple(bool(s) for s in symmetry)
 
     return _assemble_hypersingular_jit(
         vertices, faces, normals, k0,
@@ -722,251 +679,212 @@ def assemble_hypersingular(vertices, faces, normals, k0, adjacency_data,
         edge_test_indices, edge_trial_indices,
         vertex_test_indices, vertex_trial_indices,
         edge_shared_vertices, vertex_shared_vertices,
-        quad_order, singular_order, symmetry_tuple
+        quad_order, singular_order, symmetry_tuple, space
     )
 
 
-@partial(jit, static_argnames=['quad_order', 'singular_order', 'symmetry'])
+@partial(jit, static_argnames=['quad_order', 'singular_order', 'symmetry', 'space'])
 def _assemble_hypersingular_jit(vertices, faces, normals, k0,
                                  regular_test_indices, regular_trial_indices,
                                  edge_test_indices, edge_trial_indices,
                                  vertex_test_indices, vertex_trial_indices,
                                  edge_shared_vertices, vertex_shared_vertices,
-                                 quad_order, singular_order, symmetry):
+                                 quad_order, singular_order, symmetry, space):
     """JIT-compiled hypersingular assembly with pre-computed adjacency lists."""
-    n_verts = vertices.shape[0]
     n_faces = faces.shape[0]
+    n_local = 3 if space == 'P1' else 1
+    n_dofs  = vertices.shape[0] if space == 'P1' else n_faces
+    local2global = faces if space == 'P1' else jnp.arange(n_faces, dtype=jnp.int32)[:, None]
+
     n_regular_pairs = regular_test_indices.shape[0]
-    n_edge_pairs = edge_test_indices.shape[0]
-    n_vertex_pairs = vertex_test_indices.shape[0]
+    n_edge_pairs    = edge_test_indices.shape[0]
+    n_vertex_pairs  = vertex_test_indices.shape[0]
 
     quad_points, quad_weights = get_triangle_quadrature(quad_order)
-    basis_vals = p1_basis_functions(quad_points)
+    basis_vals = p1_basis_functions(quad_points) if space == 'P1' else dp0_basis_functions(quad_points)
 
-    # Precompute geometry
     jacobians = compute_jacobians(vertices, faces)
     integration_elements = compute_integration_elements(jacobians)
-    surface_curls = compute_surface_curls(jacobians, normals)
+    # Surface curls: [F, 3, 3] for P1; [F, 1, 3] zeros for DP0 (constant basis → zero curl)
+    surface_curls = (compute_surface_curls(jacobians, normals)
+                     if space == 'P1' else jnp.zeros((n_faces, 1, 3)))
     phys_points = compute_element_quadrature_points(vertices, faces, jacobians, quad_points)
 
-    # Get active reflections at trace time (empty list if no symmetry)
     active_reflections = get_active_reflections(symmetry)
 
     # =========================================================================
-    # STEP 1: Compute regular (far-field) contributions for non-adjacent pairs only
+    # STEP 1: Regular (far-field) contributions
     # =========================================================================
     def compute_regular_pair(pair_idx):
-        test_idx = regular_test_indices[pair_idx]
+        test_idx  = regular_test_indices[pair_idx]
         trial_idx = regular_trial_indices[pair_idx]
-
-        test_points = phys_points[test_idx]
-        test_normal = normals[test_idx]
-        test_curl = surface_curls[test_idx]
-        test_int_elem = integration_elements[test_idx]
-
-        trial_points = phys_points[trial_idx]
-        trial_normal = normals[trial_idx]
-        trial_curl = surface_curls[trial_idx]
-        trial_int_elem = integration_elements[trial_idx]
-
-        test_data = {'points': test_points, 'normals': test_normal, 'curl': test_curl, 'int_elem': test_int_elem}
-        trial_data = {'points': trial_points, 'normals': trial_normal, 'curl': trial_curl, 'int_elem': trial_int_elem}
-
+        test_data  = {'points': phys_points[test_idx],  'normals': normals[test_idx],
+                      'curl': surface_curls[test_idx],  'int_elem': integration_elements[test_idx]}
+        trial_data = {'points': phys_points[trial_idx], 'normals': normals[trial_idx],
+                      'curl': surface_curls[trial_idx], 'int_elem': integration_elements[trial_idx]}
         return compute_hypersingular_local_matrix(test_data, trial_data, k0, basis_vals, quad_weights, symmetry)
 
-    regular_matrices = vmap(compute_regular_pair)(jnp.arange(n_regular_pairs))  # [n_regular, 3, 3]
+    regular_matrices = vmap(compute_regular_pair)(jnp.arange(n_regular_pairs))
 
     # =========================================================================
-    # STEP 2: Compute coincident singular contributions (diagonal: F pairs)
-    # For singular pairs, direct contribution uses singular quadrature,
-    # but image contribution uses regular quadrature (reflected element is far)
+    # STEP 2: Coincident singular contributions
     # =========================================================================
     def compute_coincident(elem_idx):
-        elem_verts = vertices[faces[elem_idx]]
+        elem_verts  = vertices[faces[elem_idx]]
         elem_normal = normals[elem_idx]
-        # Direct (singular)
-        result = compute_coincident_hypersingular_matrix(elem_verts, elem_normal, k0, order=singular_order)
+        result = compute_coincident_hypersingular_matrix(
+            elem_verts, elem_normal, k0, order=singular_order, space=space)
 
-        # Image contributions (regular quadrature - reflected element is far)
-        test_points = phys_points[elem_idx]
-        test_normal = normals[elem_idx]
-        test_curl = surface_curls[elem_idx]
+        test_points   = phys_points[elem_idx]
+        test_curl     = surface_curls[elem_idx]
         test_int_elem = integration_elements[elem_idx]
-
-        trial_normal = normals[elem_idx]
-        trial_curl = surface_curls[elem_idx]
+        trial_curl    = surface_curls[elem_idx]
+        trial_normal  = normals[elem_idx]
         trial_int_elem = integration_elements[elem_idx]
 
-        # Loop over active reflections (unrolls at trace time)
         for reflection in active_reflections:
             reflected_trial_points = reflect_points(phys_points[elem_idx], reflection)
             reflected_trial_normal = reflect_normals(trial_normal, reflection)
-            reflected_trial_curl = reflect_curl(trial_curl, reflection)
+            reflected_trial_curl   = reflect_curl(trial_curl, reflection)
             result = result + _compute_hypersingular_contribution(
-                test_points, reflected_trial_points, test_normal, reflected_trial_normal,
+                test_points, reflected_trial_points, elem_normal, reflected_trial_normal,
                 test_curl, reflected_trial_curl, test_int_elem, trial_int_elem, k0,
                 basis_vals, quad_weights)
-
         return result
 
-    coincident_matrices = vmap(compute_coincident)(jnp.arange(n_faces))  # [F, 3, 3]
+    coincident_matrices = vmap(compute_coincident)(jnp.arange(n_faces))
 
     # =========================================================================
-    # STEP 3: Compute edge-adjacent singular contributions
+    # STEP 3: Edge-adjacent singular contributions
     # =========================================================================
     def compute_edge_singular(pair_idx):
-        test_idx = edge_test_indices[pair_idx]
+        test_idx  = edge_test_indices[pair_idx]
         trial_idx = edge_trial_indices[pair_idx]
-
-        test_verts = vertices[faces[test_idx]]
-        trial_verts = vertices[faces[trial_idx]]
-        test_normal = normals[test_idx]
+        test_verts   = vertices[faces[test_idx]]
+        trial_verts  = vertices[faces[trial_idx]]
+        test_normal  = normals[test_idx]
         trial_normal = normals[trial_idx]
-
-        tv1 = edge_shared_vertices[pair_idx, 0]
-        tv2 = edge_shared_vertices[pair_idx, 1]
+        tv1  = edge_shared_vertices[pair_idx, 0]
+        tv2  = edge_shared_vertices[pair_idx, 1]
         trv1 = edge_shared_vertices[pair_idx, 2]
         trv2 = edge_shared_vertices[pair_idx, 3]
 
-        # Direct (singular)
         result = compute_edge_adjacent_hypersingular_matrix(
             test_verts, trial_verts, test_normal, trial_normal, k0,
-            tv1, tv2, trv1, trv2, order=singular_order
-        )
+            tv1, tv2, trv1, trv2, order=singular_order, space=space)
 
-        # Image contributions (regular quadrature)
-        test_points = phys_points[test_idx]
-        test_curl = surface_curls[test_idx]
-        test_int_elem = integration_elements[test_idx]
-
-        trial_curl = surface_curls[trial_idx]
+        test_points    = phys_points[test_idx]
+        test_curl      = surface_curls[test_idx]
+        test_int_elem  = integration_elements[test_idx]
+        trial_curl     = surface_curls[trial_idx]
         trial_int_elem = integration_elements[trial_idx]
 
         for reflection in active_reflections:
             reflected_trial_points = reflect_points(phys_points[trial_idx], reflection)
             reflected_trial_normal = reflect_normals(normals[trial_idx], reflection)
-            reflected_trial_curl = reflect_curl(trial_curl, reflection)
+            reflected_trial_curl   = reflect_curl(trial_curl, reflection)
             result = result + _compute_hypersingular_contribution(
                 test_points, reflected_trial_points, test_normal, reflected_trial_normal,
                 test_curl, reflected_trial_curl, test_int_elem, trial_int_elem, k0,
                 basis_vals, quad_weights)
-
         return result
 
-    edge_matrices = vmap(compute_edge_singular)(jnp.arange(n_edge_pairs))  # [n_edge, 3, 3]
+    edge_matrices = vmap(compute_edge_singular)(jnp.arange(n_edge_pairs))
 
     # =========================================================================
-    # STEP 4: Compute vertex-adjacent singular contributions
+    # STEP 4: Vertex-adjacent singular contributions
     # =========================================================================
     def compute_vertex_singular(pair_idx):
-        test_idx = vertex_test_indices[pair_idx]
+        test_idx  = vertex_test_indices[pair_idx]
         trial_idx = vertex_trial_indices[pair_idx]
-
-        test_verts = vertices[faces[test_idx]]
-        trial_verts = vertices[faces[trial_idx]]
-        test_normal = normals[test_idx]
+        test_verts   = vertices[faces[test_idx]]
+        trial_verts  = vertices[faces[trial_idx]]
+        test_normal  = normals[test_idx]
         trial_normal = normals[trial_idx]
-
-        tv1 = vertex_shared_vertices[pair_idx, 0]
+        tv1  = vertex_shared_vertices[pair_idx, 0]
         trv1 = vertex_shared_vertices[pair_idx, 1]
 
-        # Direct (singular)
         result = compute_vertex_adjacent_hypersingular_matrix(
             test_verts, trial_verts, test_normal, trial_normal, k0,
-            tv1, trv1, order=singular_order
-        )
+            tv1, trv1, order=singular_order, space=space)
 
-        # Image contributions (regular quadrature)
-        test_points = phys_points[test_idx]
-        test_curl = surface_curls[test_idx]
-        test_int_elem = integration_elements[test_idx]
-
-        trial_curl = surface_curls[trial_idx]
+        test_points    = phys_points[test_idx]
+        test_curl      = surface_curls[test_idx]
+        test_int_elem  = integration_elements[test_idx]
+        trial_curl     = surface_curls[trial_idx]
         trial_int_elem = integration_elements[trial_idx]
 
         for reflection in active_reflections:
             reflected_trial_points = reflect_points(phys_points[trial_idx], reflection)
             reflected_trial_normal = reflect_normals(normals[trial_idx], reflection)
-            reflected_trial_curl = reflect_curl(trial_curl, reflection)
+            reflected_trial_curl   = reflect_curl(trial_curl, reflection)
             result = result + _compute_hypersingular_contribution(
                 test_points, reflected_trial_points, test_normal, reflected_trial_normal,
                 test_curl, reflected_trial_curl, test_int_elem, trial_int_elem, k0,
                 basis_vals, quad_weights)
-
         return result
 
-    vertex_matrices = vmap(compute_vertex_singular)(jnp.arange(n_vertex_pairs))  # [n_vertex, 3, 3]
+    vertex_matrices = vmap(compute_vertex_singular)(jnp.arange(n_vertex_pairs))
 
     # =========================================================================
-    # STEP 5: Scatter all contributions to global matrix
+    # STEP 5: Scatter
     # =========================================================================
-    operator = jnp.zeros((n_verts, n_verts), dtype=COMPLEX_DTYPE)
+    operator = jnp.zeros((n_dofs, n_dofs), dtype=COMPLEX_DTYPE)
 
-    # Scatter regular contributions (non-adjacent pairs)
-    regular_test_faces = faces[regular_test_indices]  # [n_regular, 3]
-    regular_trial_faces = faces[regular_trial_indices]  # [n_regular, 3]
-    regular_test_dofs = regular_test_faces[:, :, None]  # [n_regular, 3, 1]
-    regular_trial_dofs = regular_trial_faces[:, None, :]  # [n_regular, 1, 3]
-    regular_test_idx = jnp.broadcast_to(regular_test_dofs, (n_regular_pairs, 3, 3)).ravel()
-    regular_trial_idx = jnp.broadcast_to(regular_trial_dofs, (n_regular_pairs, 3, 3)).ravel()
-    operator = operator.at[regular_test_idx, regular_trial_idx].add(regular_matrices.ravel())
+    reg_test_l2g  = local2global[regular_test_indices]
+    reg_trial_l2g = local2global[regular_trial_indices]
+    operator = operator.at[
+        jnp.broadcast_to(reg_test_l2g[:,  :, None], (n_regular_pairs, n_local, n_local)).ravel(),
+        jnp.broadcast_to(reg_trial_l2g[:, None, :], (n_regular_pairs, n_local, n_local)).ravel(),
+    ].add(regular_matrices.ravel())
 
-    # Scatter coincident singular contributions (diagonal)
-    diag_test_dofs = faces[:, :, None]
-    diag_trial_dofs = faces[:, None, :]
-    diag_test_indices = jnp.broadcast_to(diag_test_dofs, (n_faces, 3, 3)).ravel()
-    diag_trial_indices = jnp.broadcast_to(diag_trial_dofs, (n_faces, 3, 3)).ravel()
-    operator = operator.at[diag_test_indices, diag_trial_indices].add(coincident_matrices.ravel())
+    operator = operator.at[
+        jnp.broadcast_to(local2global[:, :, None], (n_faces, n_local, n_local)).ravel(),
+        jnp.broadcast_to(local2global[:, None, :], (n_faces, n_local, n_local)).ravel(),
+    ].add(coincident_matrices.ravel())
 
-    # Scatter edge-adjacent singular contributions
-    edge_test_faces = faces[edge_test_indices]
-    edge_trial_faces = faces[edge_trial_indices]
-    edge_test_dofs = edge_test_faces[:, :, None]
-    edge_trial_dofs = edge_trial_faces[:, None, :]
-    edge_test_idx = jnp.broadcast_to(edge_test_dofs, (n_edge_pairs, 3, 3)).ravel()
-    edge_trial_idx = jnp.broadcast_to(edge_trial_dofs, (n_edge_pairs, 3, 3)).ravel()
-    operator = operator.at[edge_test_idx, edge_trial_idx].add(edge_matrices.ravel())
+    edge_test_l2g  = local2global[edge_test_indices]
+    edge_trial_l2g = local2global[edge_trial_indices]
+    operator = operator.at[
+        jnp.broadcast_to(edge_test_l2g[:,  :, None], (n_edge_pairs, n_local, n_local)).ravel(),
+        jnp.broadcast_to(edge_trial_l2g[:, None, :], (n_edge_pairs, n_local, n_local)).ravel(),
+    ].add(edge_matrices.ravel())
 
-    # Scatter vertex-adjacent singular contributions
-    vertex_test_faces = faces[vertex_test_indices]
-    vertex_trial_faces = faces[vertex_trial_indices]
-    vertex_test_dofs = vertex_test_faces[:, :, None]
-    vertex_trial_dofs = vertex_trial_faces[:, None, :]
-    vertex_test_idx = jnp.broadcast_to(vertex_test_dofs, (n_vertex_pairs, 3, 3)).ravel()
-    vertex_trial_idx = jnp.broadcast_to(vertex_trial_dofs, (n_vertex_pairs, 3, 3)).ravel()
-    operator = operator.at[vertex_test_idx, vertex_trial_idx].add(vertex_matrices.ravel())
+    vert_test_l2g  = local2global[vertex_test_indices]
+    vert_trial_l2g = local2global[vertex_trial_indices]
+    operator = operator.at[
+        jnp.broadcast_to(vert_test_l2g[:,  :, None], (n_vertex_pairs, n_local, n_local)).ravel(),
+        jnp.broadcast_to(vert_trial_l2g[:, None, :], (n_vertex_pairs, n_local, n_local)).ravel(),
+    ].add(vertex_matrices.ravel())
 
     return operator
 
 #%% Adjoint Double Layer Assembly
 
 def assemble_adjoint_double_layer(vertices, faces, normals, k0, adjacency_data,
-                                   quad_order=4, singular_order=4, symmetry=None):
+                                   quad_order=4, singular_order=4, symmetry=None, space='P1'):
     """
     Assemble adjoint double layer operator K'.
 
     K'(x,y) = ∂G(x,y)/∂n(x) — normal derivative at the test point.
-    This is the transpose of the double layer operator in the L² sense.
 
     Args:
-        vertices: [N, 3] vertex positions
-        faces: [F, 3] triangle connectivity
-        normals: [F, 3] element normals
-        k0: wavenumber
+        vertices:       [N, 3] vertex positions
+        faces:          [F, 3] triangle connectivity
+        normals:        [F, 3] element normals
+        k0:             wavenumber
         adjacency_data: pre-computed adjacency lists from load_mesh()
-        quad_order: quadrature order for regular integration
+        quad_order:     quadrature order for regular integration
         singular_order: quadrature order for singular integration
-        symmetry: tuple/array of 3 bools for (XY, XZ, YZ) planes, or None
+        symmetry:       tuple/array of 3 bools for (XY, XZ, YZ) planes, or None
+        space:          'P1' (default) or 'DP0'
     """
     (regular_test_indices, regular_trial_indices,
      edge_test_indices, edge_trial_indices,
      vertex_test_indices, vertex_trial_indices,
      edge_shared_vertices, vertex_shared_vertices) = adjacency_data
 
-    if symmetry is None:
-        symmetry_tuple = (False, False, False)
-    else:
-        symmetry_tuple = tuple(bool(s) for s in symmetry)
+    symmetry_tuple = (False, False, False) if symmetry is None else tuple(bool(s) for s in symmetry)
 
     return _assemble_adjoint_double_layer_jit(
         vertices, faces, normals, k0,
@@ -974,33 +892,33 @@ def assemble_adjoint_double_layer(vertices, faces, normals, k0, adjacency_data,
         edge_test_indices, edge_trial_indices,
         vertex_test_indices, vertex_trial_indices,
         edge_shared_vertices, vertex_shared_vertices,
-        quad_order, singular_order, symmetry_tuple
+        quad_order, singular_order, symmetry_tuple, space
     )
 
 
-@partial(jit, static_argnames=['quad_order', 'singular_order', 'symmetry'])
+@partial(jit, static_argnames=['quad_order', 'singular_order', 'symmetry', 'space'])
 def _assemble_adjoint_double_layer_jit(vertices, faces, normals, k0,
                                         regular_test_indices, regular_trial_indices,
                                         edge_test_indices, edge_trial_indices,
                                         vertex_test_indices, vertex_trial_indices,
                                         edge_shared_vertices, vertex_shared_vertices,
-                                        quad_order, singular_order, symmetry):
+                                        quad_order, singular_order, symmetry, space):
     """JIT-compiled adjoint double layer assembly."""
-    n_verts = vertices.shape[0]
     n_faces = faces.shape[0]
+    n_local = 3 if space == 'P1' else 1
+    n_dofs  = vertices.shape[0] if space == 'P1' else n_faces
+    local2global = faces if space == 'P1' else jnp.arange(n_faces, dtype=jnp.int32)[:, None]
+
     n_regular_pairs = regular_test_indices.shape[0]
-    n_edge_pairs = edge_test_indices.shape[0]
-    n_vertex_pairs = vertex_test_indices.shape[0]
+    n_edge_pairs    = edge_test_indices.shape[0]
+    n_vertex_pairs  = vertex_test_indices.shape[0]
 
     quad_points, quad_weights = get_triangle_quadrature(quad_order)
-    basis_vals = p1_basis_functions(quad_points)
+    basis_vals = p1_basis_functions(quad_points) if space == 'P1' else dp0_basis_functions(quad_points)
 
-    # Precompute geometry
     jacobians = compute_jacobians(vertices, faces)
     integration_elements = compute_integration_elements(jacobians)
     phys_points = compute_element_quadrature_points(vertices, faces, jacobians, quad_points)
-
-    # Normals tiled to quadrature points [F, Q, 3]
     normals_at_quad = jnp.tile(normals[:, None, :], (1, len(quad_weights), 1))
 
     active_reflections = get_active_reflections(symmetry)
@@ -1032,11 +950,9 @@ def _assemble_adjoint_double_layer_jit(vertices, faces, normals, k0,
     def compute_coincident(elem_idx):
         elem_verts  = vertices[faces[elem_idx]]
         elem_normal = normals[elem_idx]
-        # Direct (singular) — test_normal is elem_normal for coincident pair
         result = compute_coincident_adjoint_double_layer_matrix(
-            elem_verts, elem_normal, k0, order=singular_order)
+            elem_verts, elem_normal, k0, order=singular_order, space=space)
 
-        # Image contributions (regular quadrature — reflected element is far)
         test_points    = phys_points[elem_idx]
         test_normals_q = normals_at_quad[elem_idx]
         test_int_elem  = integration_elements[elem_idx]
@@ -1047,7 +963,6 @@ def _assemble_adjoint_double_layer_jit(vertices, faces, normals, k0,
             result = result + _compute_adjoint_double_layer_contribution(
                 test_points, reflected_trial_points, test_normals_q,
                 test_int_elem, trial_int_elem, k0, basis_vals, quad_weights)
-
         return result
 
     coincident_matrices = vmap(compute_coincident)(jnp.arange(n_faces))
@@ -1058,23 +973,19 @@ def _assemble_adjoint_double_layer_jit(vertices, faces, normals, k0,
     def compute_edge_singular(pair_idx):
         test_idx  = edge_test_indices[pair_idx]
         trial_idx = edge_trial_indices[pair_idx]
-
         test_verts   = vertices[faces[test_idx]]
         trial_verts  = vertices[faces[trial_idx]]
         test_normal  = normals[test_idx]
         trial_normal = normals[trial_idx]
-
         tv1  = edge_shared_vertices[pair_idx, 0]
         tv2  = edge_shared_vertices[pair_idx, 1]
         trv1 = edge_shared_vertices[pair_idx, 2]
         trv2 = edge_shared_vertices[pair_idx, 3]
 
-        # Direct (singular)
         result = compute_edge_adjacent_adjoint_double_layer_matrix(
             test_verts, trial_verts, test_normal, trial_normal, k0,
-            tv1, tv2, trv1, trv2, order=singular_order)
+            tv1, tv2, trv1, trv2, order=singular_order, space=space)
 
-        # Image contributions (regular quadrature)
         test_points    = phys_points[test_idx]
         test_normals_q = normals_at_quad[test_idx]
         test_int_elem  = integration_elements[test_idx]
@@ -1085,7 +996,6 @@ def _assemble_adjoint_double_layer_jit(vertices, faces, normals, k0,
             result = result + _compute_adjoint_double_layer_contribution(
                 test_points, reflected_trial_points, test_normals_q,
                 test_int_elem, trial_int_elem, k0, basis_vals, quad_weights)
-
         return result
 
     edge_matrices = vmap(compute_edge_singular)(jnp.arange(n_edge_pairs))
@@ -1096,21 +1006,17 @@ def _assemble_adjoint_double_layer_jit(vertices, faces, normals, k0,
     def compute_vertex_singular(pair_idx):
         test_idx  = vertex_test_indices[pair_idx]
         trial_idx = vertex_trial_indices[pair_idx]
-
         test_verts   = vertices[faces[test_idx]]
         trial_verts  = vertices[faces[trial_idx]]
         test_normal  = normals[test_idx]
         trial_normal = normals[trial_idx]
-
         tv1  = vertex_shared_vertices[pair_idx, 0]
         trv1 = vertex_shared_vertices[pair_idx, 1]
 
-        # Direct (singular)
         result = compute_vertex_adjacent_adjoint_double_layer_matrix(
             test_verts, trial_verts, test_normal, trial_normal, k0,
-            tv1, trv1, order=singular_order)
+            tv1, trv1, order=singular_order, space=space)
 
-        # Image contributions (regular quadrature)
         test_points    = phys_points[test_idx]
         test_normals_q = normals_at_quad[test_idx]
         test_int_elem  = integration_elements[test_idx]
@@ -1121,41 +1027,30 @@ def _assemble_adjoint_double_layer_jit(vertices, faces, normals, k0,
             result = result + _compute_adjoint_double_layer_contribution(
                 test_points, reflected_trial_points, test_normals_q,
                 test_int_elem, trial_int_elem, k0, basis_vals, quad_weights)
-
         return result
 
     vertex_matrices = vmap(compute_vertex_singular)(jnp.arange(n_vertex_pairs))
 
     # =========================================================================
-    # STEP 5: Scatter all contributions to global matrix
+    # STEP 5: Scatter
     # =========================================================================
-    operator = jnp.zeros((n_verts, n_verts), dtype=COMPLEX_DTYPE)
+    operator = jnp.zeros((n_dofs, n_dofs), dtype=COMPLEX_DTYPE)
 
-    # Scatter regular contributions
-    regular_test_faces  = faces[regular_test_indices]
-    regular_trial_faces = faces[regular_trial_indices]
-    regular_test_dofs   = jnp.broadcast_to(regular_test_faces[:, :, None], (n_regular_pairs, 3, 3)).ravel()
-    regular_trial_dofs  = jnp.broadcast_to(regular_trial_faces[:, None, :], (n_regular_pairs, 3, 3)).ravel()
-    operator = operator.at[regular_test_dofs, regular_trial_dofs].add(regular_matrices.ravel())
+    reg_t = jnp.broadcast_to(local2global[regular_test_indices][:,  :, None], (n_regular_pairs, n_local, n_local)).ravel()
+    reg_r = jnp.broadcast_to(local2global[regular_trial_indices][:, None, :], (n_regular_pairs, n_local, n_local)).ravel()
+    operator = operator.at[reg_t, reg_r].add(regular_matrices.ravel())
 
-    # Scatter coincident contributions
-    diag_test_dofs  = jnp.broadcast_to(faces[:, :, None], (n_faces, 3, 3)).ravel()
-    diag_trial_dofs = jnp.broadcast_to(faces[:, None, :], (n_faces, 3, 3)).ravel()
-    operator = operator.at[diag_test_dofs, diag_trial_dofs].add(coincident_matrices.ravel())
+    diag_t = jnp.broadcast_to(local2global[:, :, None], (n_faces, n_local, n_local)).ravel()
+    diag_r = jnp.broadcast_to(local2global[:, None, :], (n_faces, n_local, n_local)).ravel()
+    operator = operator.at[diag_t, diag_r].add(coincident_matrices.ravel())
 
-    # Scatter edge-adjacent contributions
-    edge_test_faces  = faces[edge_test_indices]
-    edge_trial_faces = faces[edge_trial_indices]
-    edge_test_dofs   = jnp.broadcast_to(edge_test_faces[:, :, None], (n_edge_pairs, 3, 3)).ravel()
-    edge_trial_dofs  = jnp.broadcast_to(edge_trial_faces[:, None, :], (n_edge_pairs, 3, 3)).ravel()
-    operator = operator.at[edge_test_dofs, edge_trial_dofs].add(edge_matrices.ravel())
+    edge_t = jnp.broadcast_to(local2global[edge_test_indices][:,  :, None], (n_edge_pairs, n_local, n_local)).ravel()
+    edge_r = jnp.broadcast_to(local2global[edge_trial_indices][:, None, :], (n_edge_pairs, n_local, n_local)).ravel()
+    operator = operator.at[edge_t, edge_r].add(edge_matrices.ravel())
 
-    # Scatter vertex-adjacent contributions
-    vertex_test_faces  = faces[vertex_test_indices]
-    vertex_trial_faces = faces[vertex_trial_indices]
-    vertex_test_dofs   = jnp.broadcast_to(vertex_test_faces[:, :, None], (n_vertex_pairs, 3, 3)).ravel()
-    vertex_trial_dofs  = jnp.broadcast_to(vertex_trial_faces[:, None, :], (n_vertex_pairs, 3, 3)).ravel()
-    operator = operator.at[vertex_test_dofs, vertex_trial_dofs].add(vertex_matrices.ravel())
+    vert_t = jnp.broadcast_to(local2global[vertex_test_indices][:,  :, None], (n_vertex_pairs, n_local, n_local)).ravel()
+    vert_r = jnp.broadcast_to(local2global[vertex_trial_indices][:, None, :], (n_vertex_pairs, n_local, n_local)).ravel()
+    operator = operator.at[vert_t, vert_r].add(vertex_matrices.ravel())
 
     return operator
 
@@ -1163,39 +1058,34 @@ def _assemble_adjoint_double_layer_jit(vertices, faces, normals, k0,
 #%% Burton-Miller LHS Assembly (merged K - 0.5*M + eta*W)
 
 def assemble_bm(vertices, faces, normals, k0, eta, adjacency_data,
-                quad_order=4, singular_order=4, symmetry=None):
+                quad_order=4, singular_order=4, symmetry=None, space='P1'):
     """
     Assemble Burton-Miller LHS matrix: lhs = K - 0.5*M + eta*W
 
-    Single-pass assembly: all three operator contributions are accumulated into
-    one N×N matrix, so peak memory is N² rather than 3×N². Geometry
-    (jacobians, integration elements, surface curls, quadrature points) is
-    computed once and shared across all operators.
+    Single-pass assembly: geometry is computed once and shared across all
+    operators, so peak memory is n_dofs² rather than 3×n_dofs².
 
     Args:
-        vertices: [N, 3] vertex positions
-        faces: [F, 3] triangle connectivity
-        normals: [F, 3] element normals
-        k0: wavenumber
-        eta: Burton-Miller coupling parameter (complex scalar)
+        vertices:       [N, 3] vertex positions
+        faces:          [F, 3] triangle connectivity
+        normals:        [F, 3] element normals
+        k0:             wavenumber
+        eta:            Burton-Miller coupling parameter (complex scalar)
         adjacency_data: pre-computed adjacency lists from load_mesh()
-        quad_order: quadrature order for regular integration
+        quad_order:     quadrature order for regular integration
         singular_order: quadrature order for singular integration
-        symmetry: tuple/array of 3 bools for (XY, XZ, YZ) symmetry planes,
-                  or None for no symmetry
+        symmetry:       tuple/array of 3 bools for (XY, XZ, YZ) planes, or None
+        space:          'P1' (default) or 'DP0'
 
     Returns:
-        lhs: [N, N] complex Burton-Miller system matrix
+        lhs: [n_dofs, n_dofs] complex Burton-Miller system matrix
     """
     (regular_test_indices, regular_trial_indices,
      edge_test_indices, edge_trial_indices,
      vertex_test_indices, vertex_trial_indices,
      edge_shared_vertices, vertex_shared_vertices) = adjacency_data
 
-    if symmetry is None:
-        symmetry_tuple = (False, False, False)
-    else:
-        symmetry_tuple = tuple(bool(s) for s in symmetry)
+    symmetry_tuple = (False, False, False) if symmetry is None else tuple(bool(s) for s in symmetry)
 
     return _assemble_bm_jit(
         vertices, faces, normals, k0, eta,
@@ -1203,31 +1093,36 @@ def assemble_bm(vertices, faces, normals, k0, eta, adjacency_data,
         edge_test_indices, edge_trial_indices,
         vertex_test_indices, vertex_trial_indices,
         edge_shared_vertices, vertex_shared_vertices,
-        quad_order, singular_order, symmetry_tuple
+        quad_order, singular_order, symmetry_tuple, space
     )
 
 
-@partial(jit, static_argnames=['quad_order', 'singular_order', 'symmetry'])
+@partial(jit, static_argnames=['quad_order', 'singular_order', 'symmetry', 'space'])
 def _assemble_bm_jit(vertices, faces, normals, k0, eta,
                       regular_test_indices, regular_trial_indices,
                       edge_test_indices, edge_trial_indices,
                       vertex_test_indices, vertex_trial_indices,
                       edge_shared_vertices, vertex_shared_vertices,
-                      quad_order, singular_order, symmetry):
+                      quad_order, singular_order, symmetry, space):
     """JIT-compiled Burton-Miller assembly: lhs = K - 0.5*M + eta*W"""
-    n_verts = vertices.shape[0]
     n_faces = faces.shape[0]
+    n_local = 3 if space == 'P1' else 1
+    n_dofs  = vertices.shape[0] if space == 'P1' else n_faces
+    local2global = faces if space == 'P1' else jnp.arange(n_faces, dtype=jnp.int32)[:, None]
+
     n_regular_pairs = regular_test_indices.shape[0]
-    n_edge_pairs = edge_test_indices.shape[0]
-    n_vertex_pairs = vertex_test_indices.shape[0]
+    n_edge_pairs    = edge_test_indices.shape[0]
+    n_vertex_pairs  = vertex_test_indices.shape[0]
 
     quad_points, quad_weights = get_triangle_quadrature(quad_order)
-    basis_vals = p1_basis_functions(quad_points)
+    basis_vals = p1_basis_functions(quad_points) if space == 'P1' else dp0_basis_functions(quad_points)
 
-    # Precompute geometry once, shared by all three operators
+    # Geometry — computed once, shared by all three operators
     jacobians = compute_jacobians(vertices, faces)
     integration_elements = compute_integration_elements(jacobians)
-    surface_curls = compute_surface_curls(jacobians, normals)
+    # Surface curls: [F, 3, 3] for P1; [F, 1, 3] zeros for DP0 (constant basis → zero curl)
+    surface_curls = (compute_surface_curls(jacobians, normals)
+                     if space == 'P1' else jnp.zeros((n_faces, 1, 3)))
     phys_points = compute_element_quadrature_points(vertices, faces, jacobians, quad_points)
     normals_at_quad = jnp.tile(normals[:, None, :], (1, len(quad_weights), 1))  # [F, Q, 3]
 
@@ -1263,9 +1158,7 @@ def _assemble_bm_jit(vertices, faces, normals, k0, eta,
 
     # =========================================================================
     # STEP 2: Coincident pairs — dl + eta*hs (singular) - 0.5*mass
-    #
-    # Mass matrix is element-local (M_ij = ∫ φ_i φ_j dS over one element),
-    # so all mass contributions are captured here. Edge/vertex steps add none.
+    # Mass is element-local, so all mass contributions live here.
     # =========================================================================
     def compute_coincident(elem_idx):
         elem_verts  = vertices[faces[elem_idx]]
@@ -1274,17 +1167,15 @@ def _assemble_bm_jit(vertices, faces, normals, k0, eta,
         test_curl   = surface_curls[elem_idx]
         trial_curl  = surface_curls[elem_idx]
 
-        # Singular direct contributions
         dl_result = compute_coincident_double_layer_matrix(
-            elem_verts, elem_normal, k0, order=singular_order)
+            elem_verts, elem_normal, k0, order=singular_order, space=space)
         hs_result = compute_coincident_hypersingular_matrix(
-            elem_verts, elem_normal, k0, order=singular_order)
+            elem_verts, elem_normal, k0, order=singular_order, space=space)
 
-        # Mass local matrix: M_ij = Σ_q w_q φ_i(q) φ_j(q) |J|
-        weighted_basis = basis_vals * (quad_weights * int_elem)  # [3, Q]
-        mass_local = basis_vals @ weighted_basis.T               # [3, 3]
+        # Local mass: M_ij = Σ_q w_q φ_i(q) φ_j(q) |J|
+        weighted_basis = basis_vals * (quad_weights * int_elem)
+        mass_local = basis_vals @ weighted_basis.T  # [n_local, n_local]
 
-        # Image contributions via regular quadrature (reflected element is far)
         test_points    = phys_points[elem_idx]
         test_int_elem  = integration_elements[elem_idx]
         trial_normals_q = normals_at_quad[elem_idx]
@@ -1296,7 +1187,6 @@ def _assemble_bm_jit(vertices, faces, normals, k0, eta,
             reflected_trial_normals = reflect_normals(trial_normals_q, reflection)
             reflected_trial_normal  = reflect_normals(trial_normal, reflection)
             reflected_trial_curl    = reflect_curl(trial_curl, reflection)
-
             dl_result = dl_result + _compute_double_layer_contribution(
                 test_points, reflected_trial_points, reflected_trial_normals,
                 test_int_elem, trial_int_elem, k0, basis_vals, quad_weights)
@@ -1307,7 +1197,7 @@ def _assemble_bm_jit(vertices, faces, normals, k0, eta,
 
         return dl_result + eta * hs_result - 0.5 * mass_local
 
-    coincident_matrices = vmap(compute_coincident)(jnp.arange(n_faces))  # [F, 3, 3]
+    coincident_matrices = vmap(compute_coincident)(jnp.arange(n_faces))
 
     # =========================================================================
     # STEP 3: Edge-adjacent pairs — dl + eta*hs (singular, no mass)
@@ -1315,14 +1205,12 @@ def _assemble_bm_jit(vertices, faces, normals, k0, eta,
     def compute_edge_pair(pair_idx):
         test_idx  = edge_test_indices[pair_idx]
         trial_idx = edge_trial_indices[pair_idx]
-
         test_verts   = vertices[faces[test_idx]]
         trial_verts  = vertices[faces[trial_idx]]
         test_normal  = normals[test_idx]
         trial_normal = normals[trial_idx]
         test_curl    = surface_curls[test_idx]
         trial_curl   = surface_curls[trial_idx]
-
         tv1  = edge_shared_vertices[pair_idx, 0]
         tv2  = edge_shared_vertices[pair_idx, 1]
         trv1 = edge_shared_vertices[pair_idx, 2]
@@ -1330,12 +1218,11 @@ def _assemble_bm_jit(vertices, faces, normals, k0, eta,
 
         dl_result = compute_edge_adjacent_double_layer_matrix(
             test_verts, trial_verts, test_normal, trial_normal, k0,
-            tv1, tv2, trv1, trv2, order=singular_order)
+            tv1, tv2, trv1, trv2, order=singular_order, space=space)
         hs_result = compute_edge_adjacent_hypersingular_matrix(
             test_verts, trial_verts, test_normal, trial_normal, k0,
-            tv1, tv2, trv1, trv2, order=singular_order)
+            tv1, tv2, trv1, trv2, order=singular_order, space=space)
 
-        # Image contributions via regular quadrature
         test_points     = phys_points[test_idx]
         test_int_elem   = integration_elements[test_idx]
         trial_normals_q = normals_at_quad[trial_idx]
@@ -1346,7 +1233,6 @@ def _assemble_bm_jit(vertices, faces, normals, k0, eta,
             reflected_trial_normals = reflect_normals(trial_normals_q, reflection)
             reflected_trial_normal  = reflect_normals(trial_normal, reflection)
             reflected_trial_curl    = reflect_curl(trial_curl, reflection)
-
             dl_result = dl_result + _compute_double_layer_contribution(
                 test_points, reflected_trial_points, reflected_trial_normals,
                 test_int_elem, trial_int_elem, k0, basis_vals, quad_weights)
@@ -1357,7 +1243,7 @@ def _assemble_bm_jit(vertices, faces, normals, k0, eta,
 
         return dl_result + eta * hs_result
 
-    edge_matrices = vmap(compute_edge_pair)(jnp.arange(n_edge_pairs))  # [n_edge, 3, 3]
+    edge_matrices = vmap(compute_edge_pair)(jnp.arange(n_edge_pairs))
 
     # =========================================================================
     # STEP 4: Vertex-adjacent pairs — dl + eta*hs (singular, no mass)
@@ -1365,25 +1251,22 @@ def _assemble_bm_jit(vertices, faces, normals, k0, eta,
     def compute_vertex_pair(pair_idx):
         test_idx  = vertex_test_indices[pair_idx]
         trial_idx = vertex_trial_indices[pair_idx]
-
         test_verts   = vertices[faces[test_idx]]
         trial_verts  = vertices[faces[trial_idx]]
         test_normal  = normals[test_idx]
         trial_normal = normals[trial_idx]
         test_curl    = surface_curls[test_idx]
         trial_curl   = surface_curls[trial_idx]
-
         tv1  = vertex_shared_vertices[pair_idx, 0]
         trv1 = vertex_shared_vertices[pair_idx, 1]
 
         dl_result = compute_vertex_adjacent_double_layer_matrix(
             test_verts, trial_verts, test_normal, trial_normal, k0,
-            tv1, trv1, order=singular_order)
+            tv1, trv1, order=singular_order, space=space)
         hs_result = compute_vertex_adjacent_hypersingular_matrix(
             test_verts, trial_verts, test_normal, trial_normal, k0,
-            tv1, trv1, order=singular_order)
+            tv1, trv1, order=singular_order, space=space)
 
-        # Image contributions via regular quadrature
         test_points     = phys_points[test_idx]
         test_int_elem   = integration_elements[test_idx]
         trial_normals_q = normals_at_quad[trial_idx]
@@ -1394,7 +1277,6 @@ def _assemble_bm_jit(vertices, faces, normals, k0, eta,
             reflected_trial_normals = reflect_normals(trial_normals_q, reflection)
             reflected_trial_normal  = reflect_normals(trial_normal, reflection)
             reflected_trial_curl    = reflect_curl(trial_curl, reflection)
-
             dl_result = dl_result + _compute_double_layer_contribution(
                 test_points, reflected_trial_points, reflected_trial_normals,
                 test_int_elem, trial_int_elem, k0, basis_vals, quad_weights)
@@ -1405,38 +1287,28 @@ def _assemble_bm_jit(vertices, faces, normals, k0, eta,
 
         return dl_result + eta * hs_result
 
-    vertex_matrices = vmap(compute_vertex_pair)(jnp.arange(n_vertex_pairs))  # [n_vertex, 3, 3]
+    vertex_matrices = vmap(compute_vertex_pair)(jnp.arange(n_vertex_pairs))
 
     # =========================================================================
-    # STEP 5: Scatter all contributions into single lhs matrix
+    # STEP 5: Scatter all contributions into lhs
     # =========================================================================
-    lhs = jnp.zeros((n_verts, n_verts), dtype=COMPLEX_DTYPE)
+    lhs = jnp.zeros((n_dofs, n_dofs), dtype=COMPLEX_DTYPE)
 
-    # Regular pairs
-    regular_test_faces  = faces[regular_test_indices]
-    regular_trial_faces = faces[regular_trial_indices]
-    regular_test_dofs   = jnp.broadcast_to(regular_test_faces[:, :, None], (n_regular_pairs, 3, 3)).ravel()
-    regular_trial_dofs  = jnp.broadcast_to(regular_trial_faces[:, None, :], (n_regular_pairs, 3, 3)).ravel()
-    lhs = lhs.at[regular_test_dofs, regular_trial_dofs].add(regular_matrices.ravel())
+    reg_t = jnp.broadcast_to(local2global[regular_test_indices][:,  :, None], (n_regular_pairs, n_local, n_local)).ravel()
+    reg_r = jnp.broadcast_to(local2global[regular_trial_indices][:, None, :], (n_regular_pairs, n_local, n_local)).ravel()
+    lhs = lhs.at[reg_t, reg_r].add(regular_matrices.ravel())
 
-    # Coincident pairs (includes mass contribution)
-    diag_test_dofs  = jnp.broadcast_to(faces[:, :, None], (n_faces, 3, 3)).ravel()
-    diag_trial_dofs = jnp.broadcast_to(faces[:, None, :], (n_faces, 3, 3)).ravel()
-    lhs = lhs.at[diag_test_dofs, diag_trial_dofs].add(coincident_matrices.ravel())
+    diag_t = jnp.broadcast_to(local2global[:, :, None], (n_faces, n_local, n_local)).ravel()
+    diag_r = jnp.broadcast_to(local2global[:, None, :], (n_faces, n_local, n_local)).ravel()
+    lhs = lhs.at[diag_t, diag_r].add(coincident_matrices.ravel())
 
-    # Edge-adjacent pairs
-    edge_test_faces  = faces[edge_test_indices]
-    edge_trial_faces = faces[edge_trial_indices]
-    edge_test_dofs   = jnp.broadcast_to(edge_test_faces[:, :, None], (n_edge_pairs, 3, 3)).ravel()
-    edge_trial_dofs  = jnp.broadcast_to(edge_trial_faces[:, None, :], (n_edge_pairs, 3, 3)).ravel()
-    lhs = lhs.at[edge_test_dofs, edge_trial_dofs].add(edge_matrices.ravel())
+    edge_t = jnp.broadcast_to(local2global[edge_test_indices][:,  :, None], (n_edge_pairs, n_local, n_local)).ravel()
+    edge_r = jnp.broadcast_to(local2global[edge_trial_indices][:, None, :], (n_edge_pairs, n_local, n_local)).ravel()
+    lhs = lhs.at[edge_t, edge_r].add(edge_matrices.ravel())
 
-    # Vertex-adjacent pairs
-    vertex_test_faces  = faces[vertex_test_indices]
-    vertex_trial_faces = faces[vertex_trial_indices]
-    vertex_test_dofs   = jnp.broadcast_to(vertex_test_faces[:, :, None], (n_vertex_pairs, 3, 3)).ravel()
-    vertex_trial_dofs  = jnp.broadcast_to(vertex_trial_faces[:, None, :], (n_vertex_pairs, 3, 3)).ravel()
-    lhs = lhs.at[vertex_test_dofs, vertex_trial_dofs].add(vertex_matrices.ravel())
+    vert_t = jnp.broadcast_to(local2global[vertex_test_indices][:,  :, None], (n_vertex_pairs, n_local, n_local)).ravel()
+    vert_r = jnp.broadcast_to(local2global[vertex_trial_indices][:, None, :], (n_vertex_pairs, n_local, n_local)).ravel()
+    lhs = lhs.at[vert_t, vert_r].add(vertex_matrices.ravel())
 
     return lhs
 
@@ -1482,30 +1354,28 @@ def compute_single_layer_local_matrix(test_elem_data, trial_elem_data, k0,
 
 
 def assemble_single_layer(vertices, faces, k0, adjacency_data,
-                          quad_order=4, singular_order=4, symmetry=None):
+                          quad_order=4, singular_order=4, symmetry=None, space='P1'):
     """
-    Assemble single layer operator V using vmap with separated singular/regular integration.
+    Assemble single layer operator V.
 
     V[i,j] = ∫∫ G(x,y) φ_i(x) φ_j(y) dS_x dS_y,  G = exp(ik|x-y|)/(4π|x-y|)
 
     Args:
-        vertices: [N, 3] vertex positions
-        faces: [F, 3] triangle connectivity
-        k0: wavenumber
+        vertices:       [N, 3] vertex positions
+        faces:          [F, 3] triangle connectivity
+        k0:             wavenumber
         adjacency_data: pre-computed adjacency lists from compute_adjacency_lists()
-        quad_order: quadrature order for regular integration
+        quad_order:     quadrature order for regular integration
         singular_order: quadrature order for singular integration
-        symmetry: tuple/array of 3 bools for (XY, XZ, YZ) symmetry planes, or None
+        symmetry:       tuple/array of 3 bools for (XY, XZ, YZ) planes, or None
+        space:          'P1' (default) or 'DP0'
     """
     (regular_test_indices, regular_trial_indices,
      edge_test_indices, edge_trial_indices,
      vertex_test_indices, vertex_trial_indices,
      edge_shared_vertices, vertex_shared_vertices) = adjacency_data
 
-    if symmetry is None:
-        symmetry_tuple = (False, False, False)
-    else:
-        symmetry_tuple = tuple(bool(s) for s in symmetry)
+    symmetry_tuple = (False, False, False) if symmetry is None else tuple(bool(s) for s in symmetry)
 
     return _assemble_single_layer_jit(
         vertices, faces, k0,
@@ -1513,30 +1383,33 @@ def assemble_single_layer(vertices, faces, k0, adjacency_data,
         edge_test_indices, edge_trial_indices,
         vertex_test_indices, vertex_trial_indices,
         edge_shared_vertices, vertex_shared_vertices,
-        quad_order, singular_order, symmetry_tuple
+        quad_order, singular_order, symmetry_tuple, space
     )
 
 
-@partial(jit, static_argnames=['quad_order', 'singular_order', 'symmetry'])
+@partial(jit, static_argnames=['quad_order', 'singular_order', 'symmetry', 'space'])
 def _assemble_single_layer_jit(vertices, faces, k0,
                                 regular_test_indices, regular_trial_indices,
                                 edge_test_indices, edge_trial_indices,
                                 vertex_test_indices, vertex_trial_indices,
                                 edge_shared_vertices, vertex_shared_vertices,
-                                quad_order, singular_order, symmetry):
+                                quad_order, singular_order, symmetry, space):
     """JIT-compiled single layer assembly with pre-computed adjacency lists."""
-    n_verts = vertices.shape[0]
     n_faces = faces.shape[0]
+    n_local = 3 if space == 'P1' else 1
+    n_dofs  = vertices.shape[0] if space == 'P1' else n_faces
+    local2global = faces if space == 'P1' else jnp.arange(n_faces, dtype=jnp.int32)[:, None]
+
     n_regular_pairs = regular_test_indices.shape[0]
     n_edge_pairs    = edge_test_indices.shape[0]
     n_vertex_pairs  = vertex_test_indices.shape[0]
 
     quad_points, quad_weights = get_triangle_quadrature(quad_order)
-    basis_vals = p1_basis_functions(quad_points)
+    basis_vals = p1_basis_functions(quad_points) if space == 'P1' else dp0_basis_functions(quad_points)
 
-    jacobians           = compute_jacobians(vertices, faces)
+    jacobians            = compute_jacobians(vertices, faces)
     integration_elements = compute_integration_elements(jacobians)
-    phys_points         = compute_element_quadrature_points(vertices, faces, jacobians, quad_points)
+    phys_points          = compute_element_quadrature_points(vertices, faces, jacobians, quad_points)
 
     active_reflections = get_active_reflections(symmetry)
 
@@ -1559,9 +1432,8 @@ def _assemble_single_layer_jit(vertices, faces, k0,
     # =========================================================================
     def compute_coincident(elem_idx):
         elem_verts = vertices[faces[elem_idx]]
-        result = compute_coincident_single_layer_matrix(elem_verts, k0, order=singular_order)
+        result = compute_coincident_single_layer_matrix(elem_verts, k0, order=singular_order, space=space)
 
-        # Image contributions (reflected element is far — regular quadrature)
         test_points    = phys_points[elem_idx]
         test_int_elem  = integration_elements[elem_idx]
         trial_int_elem = integration_elements[elem_idx]
@@ -1571,7 +1443,6 @@ def _assemble_single_layer_jit(vertices, faces, k0,
             result = result + _compute_single_layer_contribution(
                 test_points, reflected_trial_points,
                 test_int_elem, trial_int_elem, k0, basis_vals, quad_weights)
-
         return result
 
     coincident_matrices = vmap(compute_coincident)(jnp.arange(n_faces))
@@ -1582,7 +1453,6 @@ def _assemble_single_layer_jit(vertices, faces, k0,
     def compute_edge_singular(pair_idx):
         test_idx  = edge_test_indices[pair_idx]
         trial_idx = edge_trial_indices[pair_idx]
-
         test_verts  = vertices[faces[test_idx]]
         trial_verts = vertices[faces[trial_idx]]
         tv1  = edge_shared_vertices[pair_idx, 0]
@@ -1591,9 +1461,8 @@ def _assemble_single_layer_jit(vertices, faces, k0,
         trv2 = edge_shared_vertices[pair_idx, 3]
 
         result = compute_edge_adjacent_single_layer_matrix(
-            test_verts, trial_verts, k0, tv1, tv2, trv1, trv2, order=singular_order)
+            test_verts, trial_verts, k0, tv1, tv2, trv1, trv2, order=singular_order, space=space)
 
-        # Image contributions (regular quadrature)
         test_points    = phys_points[test_idx]
         test_int_elem  = integration_elements[test_idx]
         trial_int_elem = integration_elements[trial_idx]
@@ -1603,7 +1472,6 @@ def _assemble_single_layer_jit(vertices, faces, k0,
             result = result + _compute_single_layer_contribution(
                 test_points, reflected_trial_points,
                 test_int_elem, trial_int_elem, k0, basis_vals, quad_weights)
-
         return result
 
     edge_matrices = vmap(compute_edge_singular)(jnp.arange(n_edge_pairs))
@@ -1614,16 +1482,14 @@ def _assemble_single_layer_jit(vertices, faces, k0,
     def compute_vertex_singular(pair_idx):
         test_idx  = vertex_test_indices[pair_idx]
         trial_idx = vertex_trial_indices[pair_idx]
-
         test_verts  = vertices[faces[test_idx]]
         trial_verts = vertices[faces[trial_idx]]
         tv1  = vertex_shared_vertices[pair_idx, 0]
         trv1 = vertex_shared_vertices[pair_idx, 1]
 
         result = compute_vertex_adjacent_single_layer_matrix(
-            test_verts, trial_verts, k0, tv1, trv1, order=singular_order)
+            test_verts, trial_verts, k0, tv1, trv1, order=singular_order, space=space)
 
-        # Image contributions (regular quadrature)
         test_points    = phys_points[test_idx]
         test_int_elem  = integration_elements[test_idx]
         trial_int_elem = integration_elements[trial_idx]
@@ -1633,36 +1499,29 @@ def _assemble_single_layer_jit(vertices, faces, k0,
             result = result + _compute_single_layer_contribution(
                 test_points, reflected_trial_points,
                 test_int_elem, trial_int_elem, k0, basis_vals, quad_weights)
-
         return result
 
     vertex_matrices = vmap(compute_vertex_singular)(jnp.arange(n_vertex_pairs))
 
     # =========================================================================
-    # STEP 5: Scatter all contributions to global matrix
+    # STEP 5: Scatter
     # =========================================================================
-    operator = jnp.zeros((n_verts, n_verts), dtype=COMPLEX_DTYPE)
+    operator = jnp.zeros((n_dofs, n_dofs), dtype=COMPLEX_DTYPE)
 
-    regular_test_faces  = faces[regular_test_indices]
-    regular_trial_faces = faces[regular_trial_indices]
-    regular_test_idx  = jnp.broadcast_to(regular_test_faces[:,  :, None], (n_regular_pairs, 3, 3)).ravel()
-    regular_trial_idx = jnp.broadcast_to(regular_trial_faces[:, None, :], (n_regular_pairs, 3, 3)).ravel()
-    operator = operator.at[regular_test_idx, regular_trial_idx].add(regular_matrices.ravel())
+    reg_t = jnp.broadcast_to(local2global[regular_test_indices][:,  :, None], (n_regular_pairs, n_local, n_local)).ravel()
+    reg_r = jnp.broadcast_to(local2global[regular_trial_indices][:, None, :], (n_regular_pairs, n_local, n_local)).ravel()
+    operator = operator.at[reg_t, reg_r].add(regular_matrices.ravel())
 
-    diag_test_idx  = jnp.broadcast_to(faces[:, :, None],  (n_faces, 3, 3)).ravel()
-    diag_trial_idx = jnp.broadcast_to(faces[:, None, :],  (n_faces, 3, 3)).ravel()
-    operator = operator.at[diag_test_idx, diag_trial_idx].add(coincident_matrices.ravel())
+    diag_t = jnp.broadcast_to(local2global[:, :, None], (n_faces, n_local, n_local)).ravel()
+    diag_r = jnp.broadcast_to(local2global[:, None, :], (n_faces, n_local, n_local)).ravel()
+    operator = operator.at[diag_t, diag_r].add(coincident_matrices.ravel())
 
-    edge_test_faces  = faces[edge_test_indices]
-    edge_trial_faces = faces[edge_trial_indices]
-    edge_test_idx  = jnp.broadcast_to(edge_test_faces[:,  :, None], (n_edge_pairs, 3, 3)).ravel()
-    edge_trial_idx = jnp.broadcast_to(edge_trial_faces[:, None, :], (n_edge_pairs, 3, 3)).ravel()
-    operator = operator.at[edge_test_idx, edge_trial_idx].add(edge_matrices.ravel())
+    edge_t = jnp.broadcast_to(local2global[edge_test_indices][:,  :, None], (n_edge_pairs, n_local, n_local)).ravel()
+    edge_r = jnp.broadcast_to(local2global[edge_trial_indices][:, None, :], (n_edge_pairs, n_local, n_local)).ravel()
+    operator = operator.at[edge_t, edge_r].add(edge_matrices.ravel())
 
-    vertex_test_faces  = faces[vertex_test_indices]
-    vertex_trial_faces = faces[vertex_trial_indices]
-    vertex_test_idx  = jnp.broadcast_to(vertex_test_faces[:,  :, None], (n_vertex_pairs, 3, 3)).ravel()
-    vertex_trial_idx = jnp.broadcast_to(vertex_trial_faces[:, None, :], (n_vertex_pairs, 3, 3)).ravel()
-    operator = operator.at[vertex_test_idx, vertex_trial_idx].add(vertex_matrices.ravel())
+    vert_t = jnp.broadcast_to(local2global[vertex_test_indices][:,  :, None], (n_vertex_pairs, n_local, n_local)).ravel()
+    vert_r = jnp.broadcast_to(local2global[vertex_trial_indices][:, None, :], (n_vertex_pairs, n_local, n_local)).ravel()
+    operator = operator.at[vert_t, vert_r].add(vertex_matrices.ravel())
 
     return operator
