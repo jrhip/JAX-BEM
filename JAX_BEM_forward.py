@@ -1,6 +1,3 @@
-import jax
-jax.config.update('jax_platform_name', 'cpu')
-jax.config.update('jax_enable_x64', False)
 import jax.numpy as jnp
 from jax.scipy.sparse.linalg import gmres
 import bempp_cl.api
@@ -93,21 +90,27 @@ if __name__ == "__main__":
 
     # Problem parameters
     SPACE = 'P1'
-    quad_order = 4  # quadrature order (1, 3, 4, or 7). 4 is bempp default.
-    grid_size = 4
-    resolution = 128
-    eta = 1j
-    c = 343.0
-    freq = 250.0
-    k0 = (2 * jnp.pi * freq) / c
+    quad_order = 4                  # Quadrature order (1, 3, 4, or 7). 4 is bempp default.
+    grid_size = 4                   # Metres
+    resolution = 128                # Grid resolution points
+    c = 343.0                       # Speed of sound
+    freq = 250.0                    # Hz
+    k0 = (2 * jnp.pi * freq) / c    # Wavenumber
+    eta = 1j/k0                     # Burton-Miller coupling
     incident_direction = jnp.array([1.0, 0.0, 0.0])
-    r0 = 1  # Radius of sphere for analytic solution
-    symmetry = jnp.array([True, True, False])
+    r0 = 1                          # Radius of the rigid sphere
+    # Symmetry planes, (XY, XZ, YZ)
+    symmetry = jnp.array([False, False, False])
 
     analytic_solution = sphere_analytic(k0, r0, incident_direction,
                                         grid_size, resolution)
-
-    mesh = bempp_cl.api.shapes.regular_sphere(int(3))
+    
+    # Integer parameter sets the mesh refinement of the sphere:
+    # 3 - 512 elements
+    # 4 - 2048 elements
+    # 5 - 8192 elements
+    # etc. 
+    mesh = bempp_cl.api.shapes.regular_sphere(int(4))
     vertices, elements, normals, adjacency_data, _ = load_mesh(mesh, symmetry)
 
     print(f"Wavenumber k0 = {k0:.3f}")
@@ -121,7 +124,7 @@ if __name__ == "__main__":
         normals=normals,
         adjacency_data=adjacency_data,
         incident_direction=incident_direction,
-        eta=eta / k0,
+        eta=eta,
         quad_order=quad_order,
         grid_size=grid_size,
         resolution=resolution,

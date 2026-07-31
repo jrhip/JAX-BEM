@@ -3,6 +3,7 @@ import jax.lax as lax
 from jax import jit, checkpoint
 from functools import partial
 from core.JAX_BEM_operators import get_active_reflections, reflect_points
+from core.JAX_BEM_kernels import choose_chunk_size
 from core.JAX_BEM_config import COMPLEX_DTYPE
 
 M_INV_4PI = 1.0 / (4.0 * jnp.pi)
@@ -47,8 +48,34 @@ def get_boundary_data(vertices, elements):
     return centroids, cross / norms[:, None], 0.5 * norms
 
 
+def _kirchhoff_helmholtz(eval_points, boundary_points, boundary_normals, boundary_areas,
+                         element_values, neumann_elem_values, k0, active_reflections):
+    """
+    K[p](x) - V[g](x) at a set of evaluation points.
+
+    Holds [M, F] arrays, so callers evaluating many points must chunk.
+    Image sources are accumulated one at a time, so the peak is one
+    contribution regardless of how many symmetry planes are active.
+    """
+    def contribution(source_points, source_normals):
+        r_diff = eval_points[:, None, :] - source_points[None, :, :]
+        R = jnp.linalg.norm(r_diff, axis=2)
+        # (r_hat . n) without materialising r_hat, which is [M, F, 3]
+        R_dot_n = jnp.sum(r_diff * source_normals[None, :, :], axis=2) / R
+        G = jnp.exp(1j * k0 * R) * M_INV_4PI / R
+        dG_dn = -1j * k0 * G * R_dot_n * (1.0 - 1.0 / (1j * k0 * R))
+        return ((dG_dn * boundary_areas[None, :]) @ element_values
+                - (G * boundary_areas[None, :]) @ neumann_elem_values)
+
+    result = contribution(boundary_points, boundary_normals)
+    for reflection in active_reflections:
+        result = result + contribution(reflect_points(boundary_points, reflection),
+                                       reflect_points(boundary_normals, reflection))
+    return result
+
+
 def propagate(vertices, elements, node_values, k0, grid_size,
-              resolution, symmetry=None, chunk_size=65536, grid_center=None,
+              resolution, symmetry=None, chunk_size=None, grid_center=None,
               neumann_elem_values=None, space='P1'):
     """
     Matrix-free propagation using chunked computation.
@@ -67,7 +94,9 @@ def propagate(vertices, elements, node_values, k0, grid_size,
         grid_size:          domain grid extent (cubic side length)
         resolution:         grid resolution (M = resolution^3)
         symmetry:           tuple/array of 3 bools for (XY, XZ, YZ) planes, or None
-        chunk_size:         domain points per chunk (tune for memory/speed)
+        chunk_size:         domain points per chunk; None sizes it from
+                            TILE_BUDGET_MB in JAX_BEM_config (recommended — a
+                            fixed chunk grows linearly in memory with F)
         grid_center:        [3] centre of domain grid (default: origin)
         neumann_elem_values: [F] element-wise Neumann data dp/dn; None → DL only
         space:              'P1' (default) or 'DP0'
@@ -87,6 +116,9 @@ def propagate(vertices, elements, node_values, k0, grid_size,
         neumann_elem_values = jnp.zeros(n_faces, dtype=COMPLEX_DTYPE)
     else:
         neumann_elem_values = jnp.asarray(neumann_elem_values, dtype=COMPLEX_DTYPE)
+
+    if chunk_size is None:
+        chunk_size = min(choose_chunk_size(n_faces), resolution ** 3)
 
     return _propagate_jit(vertices, elements, node_values, k0, grid_size,
                           resolution, chunk_size, symmetry_tuple, center,
@@ -128,36 +160,9 @@ def _propagate_jit(vertices, elements, node_values, k0, grid_size,
 
     def compute_chunk_matvec(chunk_points):
         """K[p] - V[g] for a chunk of domain points."""
-        r_diff = chunk_points[:, None, :] - boundary_points[None, :, :]
-        R = jnp.linalg.norm(r_diff, axis=2)
-        R_hat = r_diff / R[:, :, None]
-        R_dot_n = jnp.sum(R_hat * boundary_normals[None, :, :], axis=2)
-
-        G = jnp.exp(1j * k0 * R) * M_INV_4PI / R
-        dG_dn = -1j * k0 * G * R_dot_n * (1.0 - 1.0 / (1j * k0 * R))
-
-        # DL and SL weighted by element area  [chunk_size, F]
-        DL = dG_dn * boundary_areas[None, :]
-        SL = G * boundary_areas[None, :]
-        result = DL @ element_values - SL @ neumann_elem_values
-
-        for reflection in active_reflections:
-            reflected_boundary_points = reflect_points(boundary_points, reflection)
-            reflected_boundary_normals = reflect_points(boundary_normals, reflection)
-
-            r_diff_img = chunk_points[:, None, :] - reflected_boundary_points[None, :, :]
-            R_img = jnp.linalg.norm(r_diff_img, axis=2)
-            R_hat_img = r_diff_img / R_img[:, :, None]
-            R_dot_n_img = jnp.sum(R_hat_img * reflected_boundary_normals[None, :, :], axis=2)
-
-            G_img = jnp.exp(1j * k0 * R_img) * M_INV_4PI / R_img
-            dG_dn_img = -1j * k0 * G_img * R_dot_n_img * (1.0 - 1.0 / (1j * k0 * R_img))
-
-            DL_img = dG_dn_img * boundary_areas[None, :]
-            SL_img = G_img * boundary_areas[None, :]
-            result = result + DL_img @ element_values - SL_img @ neumann_elem_values
-
-        return result
+        return _kirchhoff_helmholtz(chunk_points, boundary_points, boundary_normals,
+                                    boundary_areas, element_values, neumann_elem_values,
+                                    k0, active_reflections)
 
     result_chunked = lax.map(checkpoint(compute_chunk_matvec), domain_chunked)
 
@@ -221,32 +226,6 @@ def _propagate_to_points_jit(vertices, elements, node_values, k0,
 
     boundary_points, boundary_normals, boundary_areas = get_boundary_data(vertices, elements)
 
-    # Direct contribution [M, F]
-    r_diff = eval_points[:, None, :] - boundary_points[None, :, :]
-    R = jnp.linalg.norm(r_diff, axis=2)
-    R_hat = r_diff / R[:, :, None]
-    R_dot_n = jnp.sum(R_hat * boundary_normals[None, :, :], axis=2)
-    G = jnp.exp(1j * k0 * R) * M_INV_4PI / R
-    dG_dn = -1j * k0 * G * R_dot_n * (1.0 - 1.0 / (1j * k0 * R))
-
-    DL = dG_dn * boundary_areas[None, :]  # [M, F]
-    SL = G * boundary_areas[None, :]      # [M, F]
-    result = DL @ element_values - SL @ neumann_elem_values
-
-    # Image contributions
-    for reflection in active_reflections:
-        reflected_boundary_points = reflect_points(boundary_points, reflection)
-        reflected_boundary_normals = reflect_points(boundary_normals, reflection)
-
-        r_diff_img = eval_points[:, None, :] - reflected_boundary_points[None, :, :]
-        R_img = jnp.linalg.norm(r_diff_img, axis=2)
-        R_hat_img = r_diff_img / R_img[:, :, None]
-        R_dot_n_img = jnp.sum(R_hat_img * reflected_boundary_normals[None, :, :], axis=2)
-        G_img = jnp.exp(1j * k0 * R_img) * M_INV_4PI / R_img
-        dG_dn_img = -1j * k0 * G_img * R_dot_n_img * (1.0 - 1.0 / (1j * k0 * R_img))
-
-        DL_img = dG_dn_img * boundary_areas[None, :]
-        SL_img = G_img * boundary_areas[None, :]
-        result = result + DL_img @ element_values - SL_img @ neumann_elem_values
-
-    return result  # [M]
+    return _kirchhoff_helmholtz(eval_points, boundary_points, boundary_normals,
+                                boundary_areas, element_values, neumann_elem_values,
+                                k0, active_reflections)  # [M]

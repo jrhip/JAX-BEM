@@ -365,79 +365,71 @@ def compute_element_quadrature_points(vertices, faces, jacobians, quad_points):
 
 def compute_adjacency_lists(faces):
     """
-    Compute lists of adjacent element pairs (non-JIT, uses numpy).
+    List the near (singular) element pairs: those sharing at least one vertex.
 
-    This must be called outside JIT because it produces variable-length arrays.
+    Built from a vertex-to-element incidence map, so time and memory are O(F).
+    Non-adjacent pairs are deliberately not listed — the assembler integrates
+    every pair with regular quadrature and corrects only these near pairs
+    afterwards, following bempp.  The previous version compared all pairs,
+    materialising an [F, F, 3, 3] array plus an explicit list of every regular
+    pair, which set the memory ceiling for the whole solver.
+
+    Non-JIT (numpy): the output lengths depend on mesh topology, which is fixed
+    while vertex positions vary, so this stays outside the differentiable path.
 
     Args:
         faces: [F, 3] face connectivity (can be JAX or numpy array)
 
     Returns:
         Tuple containing:
-        - regular_test_indices, regular_trial_indices: indices of non-adjacent (regular) pairs
-        - edge_test_indices, edge_trial_indices: indices of edge-adjacent pairs
-        - vertex_test_indices, vertex_trial_indices: indices of vertex-adjacent pairs
+        - edge_test_indices, edge_trial_indices: edge-adjacent pairs (2 shared vertices)
+        - vertex_test_indices, vertex_trial_indices: vertex-adjacent pairs (1 shared vertex)
         - edge_shared_vertices: [n_edge, 4] array of (test_v1, test_v2, trial_v1, trial_v2)
         - vertex_shared_vertices: [n_vertex, 2] array of (test_v, trial_v)
+
+    Coincident pairs are the diagonal and are not listed.
     """
-
     faces_np = np.asarray(faces)
+    n_faces = len(faces_np)
 
-    # Compute shared vertex count matrix
-    faces_i = faces_np[:, None, :]  # [F, 1, 3]
-    faces_j = faces_np[None, :, :]  # [1, F, 3]
-    matches = faces_i[:, :, :, None] == faces_j[:, :, None, :]  # [F, F, 3, 3]
-    shared_count = np.sum(np.any(matches, axis=3), axis=2)  # [F, F]
+    # Group elements by the vertices they use, then take every pair of elements
+    # meeting at a vertex: the only candidates for edge or vertex adjacency.
+    vertex_ids = faces_np.ravel()
+    element_ids = np.repeat(np.arange(n_faces), 3)
+    order = np.argsort(vertex_ids, kind='stable')
+    vertex_ids, element_ids = vertex_ids[order], element_ids[order]
+    groups = np.split(element_ids, np.flatnonzero(np.diff(vertex_ids)) + 1)
 
-    # Find regular pairs (0 shared vertices - non-adjacent)
-    regular_test_indices, regular_trial_indices = np.where(shared_count == 0)
+    candidates = np.concatenate([
+        np.stack(np.meshgrid(group, group, indexing='ij'), axis=-1).reshape(-1, 2)
+        for group in groups
+    ])
 
-    # Find edge-adjacent pairs (2 shared vertices)
-    edge_test_indices, edge_trial_indices = np.where(shared_count == 2)
+    # A pair turns up once per shared vertex, so the occurrence count classifies it.
+    keys, shared_count = np.unique(candidates[:, 0] * n_faces + candidates[:, 1],
+                                   return_counts=True)
+    test_indices, trial_indices = np.divmod(keys, n_faces)
+    distinct = test_indices != trial_indices
 
-    # Find vertex-adjacent pairs (1 shared vertex)
-    vertex_test_indices, vertex_trial_indices = np.where(shared_count == 1)
+    edge = distinct & (shared_count == 2)
+    vertex = distinct & (shared_count == 1)
 
-    # For edge pairs, find which vertices are shared
-    n_edge = len(edge_test_indices)
-    edge_shared_vertices = np.zeros((n_edge, 4), dtype=np.int32)
+    def shared_local_indices(test_pairs, trial_pairs, n_shared):
+        """Local (0..2) vertex indices of the shared vertices, test side then trial."""
+        matches = faces_np[test_pairs][:, :, None] == faces_np[trial_pairs][:, None, :]
+        located = np.argwhere(matches)  # ordered by (pair, test slot, trial slot)
+        if len(located) != n_shared * len(test_pairs):
+            raise ValueError("Mesh has repeated vertices within an element.")
+        located = located.reshape(len(test_pairs), n_shared, 3)
+        return np.concatenate([located[:, :, 1], located[:, :, 2]], axis=1)
 
-    for idx in range(n_edge):
-        ti, tri = edge_test_indices[idx], edge_trial_indices[idx]
-        test_face = faces_np[ti]
-        trial_face = faces_np[tri]
+    edge_test_indices, edge_trial_indices = test_indices[edge], trial_indices[edge]
+    vertex_test_indices, vertex_trial_indices = test_indices[vertex], trial_indices[vertex]
 
-        # Find shared vertices
-        test_shared = []
-        trial_shared = []
-        for tv in range(3):
-            for trv in range(3):
-                if test_face[tv] == trial_face[trv]:
-                    test_shared.append(tv)
-                    trial_shared.append(trv)
+    edge_shared_vertices = shared_local_indices(edge_test_indices, edge_trial_indices, 2)
+    vertex_shared_vertices = shared_local_indices(vertex_test_indices, vertex_trial_indices, 1)
 
-        edge_shared_vertices[idx] = [test_shared[0], test_shared[1],
-                                      trial_shared[0], trial_shared[1]]
-
-    # For vertex pairs, find which vertex is shared
-    n_vertex = len(vertex_test_indices)
-    vertex_shared_vertices = np.zeros((n_vertex, 2), dtype=np.int32)
-
-    for idx in range(n_vertex):
-        ti, tri = vertex_test_indices[idx], vertex_trial_indices[idx]
-        test_face = faces_np[ti]
-        trial_face = faces_np[tri]
-
-        for tv in range(3):
-            for trv in range(3):
-                if test_face[tv] == trial_face[trv]:
-                    vertex_shared_vertices[idx] = [tv, trv]
-                    break
-            else:
-                continue
-            break
-
-    return (jnp.array(regular_test_indices), jnp.array(regular_trial_indices),
-            jnp.array(edge_test_indices), jnp.array(edge_trial_indices),
-            jnp.array(vertex_test_indices), jnp.array(vertex_trial_indices),
-            jnp.array(edge_shared_vertices), jnp.array(vertex_shared_vertices))
+    as_index = lambda array: jnp.array(array, dtype=jnp.int32)
+    return (as_index(edge_test_indices), as_index(edge_trial_indices),
+            as_index(vertex_test_indices), as_index(vertex_trial_indices),
+            as_index(edge_shared_vertices), as_index(vertex_shared_vertices))

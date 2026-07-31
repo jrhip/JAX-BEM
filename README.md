@@ -16,7 +16,7 @@ You might need to manually set the location of the gmsh binary:
 
 Spyder recommended: https://www.spyder-ide.org/
 
-Open JAX_BEM_test.py and run to demo the scattering from a rigid sphere benchmark, plots are displayed in-line and saved to /plots. 
+Open JAX_BEM_forward.py and run to demo the scattering from a rigid sphere benchmark, plots are displayed in-line and saved to /plots. 
 
 JAX_BEM_errorvN.py computes the error and wall clock time with increasing mesh refinement and produces the plot from the paper. 
 

@@ -1,6 +1,3 @@
-import jax
-jax.config.update('jax_platform_name', 'cpu')
-jax.config.update('jax_enable_x64', False)
 import jax.numpy as jnp
 from jax.scipy.sparse.linalg import gmres
 import bempp_cl.api
@@ -93,11 +90,12 @@ if __name__ == "__main__":
 
     # Problem parameters
     SPACE = 'P1'
-    quad_order = 4  # quadrature order (1, 3, 4, or 7). 4 is bempp default.
-    grid_size = 4
-    resolution = 128
-    eta = 1j
-    wavenumbers = [1.0, 10.0, 20.0, 40.0]
+    quad_order = 4                  # Quadrature order (1, 3, 4, or 7). 4 is bempp default.
+    grid_size = 4                   # Metres
+    resolution = 128                # Grid resolution points
+    c = 343.0                       # Speed of sound
+    eta = 1j                        # Burton-Miller coupling
+    wavenumbers = [1.0, 10.0, 20.0, 30.0]
     incident_direction = jnp.array([1.0, 0.0, 0.0])  # +x direction
     r0 = 1  # Radius of sphere for analytic solution
     symmetry = jnp.array([False, False, False])
