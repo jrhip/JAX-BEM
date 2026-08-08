@@ -63,7 +63,6 @@ def bem_solve(k0, vertices, elements, normals, adjacency_data, incident_directio
     boundary_solution.block_until_ready()
 
     toc = time.perf_counter()
-    toc_total = time.perf_counter()
 
     if info == 0:
         print("GMRES converged successfully")
@@ -75,6 +74,8 @@ def bem_solve(k0, vertices, elements, normals, adjacency_data, incident_directio
                                 k0, grid_size, resolution,
                                 symmetry=symmetry, space=space)
     domain_solution.block_until_ready()
+
+    toc_total = time.perf_counter()
 
     jax_time = toc_total - tic_total
     print("Total time: ", round(jax_time, 3), "seconds")

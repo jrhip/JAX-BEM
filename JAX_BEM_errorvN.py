@@ -63,7 +63,6 @@ def bem_solve(k0, vertices, elements, normals, adjacency_data, incident_directio
     boundary_solution.block_until_ready()
 
     toc = time.perf_counter()
-    toc_total = time.perf_counter()
 
     if info == 0:
         print("GMRES converged successfully")
@@ -75,6 +74,8 @@ def bem_solve(k0, vertices, elements, normals, adjacency_data, incident_directio
                                 k0, grid_size, resolution,
                                 symmetry=symmetry, space=space)
     domain_solution.block_until_ready()
+
+    toc_total = time.perf_counter()
 
     jax_time = toc_total - tic_total
     print("Total time: ", round(jax_time, 3), "seconds")
@@ -92,7 +93,7 @@ if __name__ == "__main__":
     grid_size = 4                   # Metres
     resolution = 128                # Grid resolution points
     c = 343.0                       # Speed of sound
-    N = [2, 3, 4, 5]  # bempp regular_sphere refinement levels → [128, 512, 2048, 8192] elements
+    N = [1, 2, 3, 4, 5]  # bempp regular_sphere refinement levels → [128, 512, 2048, 8192] elements
     incident_direction = jnp.array([1.0, 0.0, 0.0])  # +x direction
     r0 = 1  # Radius of sphere for analytic solution
     symmetry = jnp.array([False, False, False])
@@ -176,13 +177,14 @@ if __name__ == "__main__":
     
     cm = 1/2.54
     
-    y = bp_domain_mae
+    # Discard the first run to ignore cold start
+    y = bp_domain_mae[1:]
     
     lower = np.percentile(y, 10, axis=(1,2,3))
     median = np.percentile(y, 50, axis=(1,2,3))
     upper = np.percentile(y, 90, axis=(1,2,3))
     
-    y2 = jax_domain_mae
+    y2 = jax_domain_mae[1:]
     
     lower2 = np.percentile(y2, 10, axis=(1,2,3))
     median2 = np.percentile(y2, 50, axis=(1,2,3))
@@ -204,8 +206,8 @@ if __name__ == "__main__":
     plt.show()
 
     plt.rcParams['figure.figsize'] = (8*cm, 7*cm)
-    plt.loglog(N_elems, bempp_time, label='bempp')
-    plt.loglog(N_elems, jax_time, label='JAX-BEM')
+    plt.loglog(N_elems, bempp_time[1:], label='bempp')
+    plt.loglog(N_elems, jax_time[1:], label='JAX-BEM')
     plt.xlabel('N')
     plt.ylabel('Time [s]')
     plt.xlim(100, 10000)
