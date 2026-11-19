@@ -343,14 +343,19 @@ def get_triangle_quadrature(order=4):
         weights = jnp.array([-0.5625, 0.5208333333333333,
                              0.5208333333333333, 0.5208333333333333]) * 0.5
     elif order == 7:
-        a1, a2 = 0.0597158717, 0.7974269853
-        b1, b2 = 0.4701420641, 0.1012865073
-        w1, w2, w3 = 0.1125, 0.0629695902, 0.0661970763
+        # Radon 7-point rule (degree of precision 5). Each orbit is the point
+        # (a, a, 1-2a) in barycentric coordinates and its two permutations.
+        # Weights already include the reference-triangle area (sum = 1/2).
+        s15 = 15.0 ** 0.5
+        a = (6.0 - s15) / 21.0
+        b = (6.0 + s15) / 21.0
+        wa = (155.0 - s15) / 2400.0
+        wb = (155.0 + s15) / 2400.0
         points = jnp.array([
-            [1/3, a1, a2, a1, b1, b2, b1],  # xi
-            [1/3, a1, a1, a2, b1, b1, b2]   # eta
+            [1/3, a, 1 - 2*a, a,       b, 1 - 2*b, b      ],  # xi
+            [1/3, a, a,       1 - 2*a, b, b,       1 - 2*b]   # eta
         ])
-        weights = jnp.array([w1, w2, w2, w2, w3, w3, w3]) * 0.5
+        weights = jnp.array([9/80, wa, wa, wa, wb, wb, wb])
     else:
         raise ValueError(f"Unsupported order: {order}. Use 1, 3, 4, or 7.")
     
